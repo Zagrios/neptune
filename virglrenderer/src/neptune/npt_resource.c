@@ -284,8 +284,8 @@ npt_sync_map_remove(struct npt_context *ctx, struct npt_sync_map_entry *e)
       ctx->sync_maps.entries[--ctx->sync_maps.count];
 }
 
-HRESULT
-npt_resource_map(struct npt_context *ctx,
+static HRESULT
+npt_resource_map_pinned(struct npt_context *ctx,
                  uint64_t context_id, uint64_t resource_id,
                  uint32_t subresource, uint32_t access_flags,
                  uint32_t api_map_flags, uint32_t shmem_res_id,
@@ -442,8 +442,8 @@ npt_resource_map(struct npt_context *ctx,
    return hr;
 }
 
-HRESULT
-npt_resource_unmap(struct npt_context *ctx,
+static HRESULT
+npt_resource_unmap_pinned(struct npt_context *ctx,
                    uint64_t context_id, uint64_t resource_id,
                    uint32_t subresource, uint32_t shmem_res_id,
                    uint32_t shmem_offset, uint64_t byte_size,
@@ -602,4 +602,49 @@ npt_resource_unmap(struct npt_context *ctx,
 
    npt_sync_map_remove(ctx, entry);
    return NPT_S_OK;
+}
+
+/* Map/Unmap copy to and from the guest's shmem slot. A guest destroy of that shmem arrives on another thread
+ * while ring commands naming it are still queued, so pin it for the whole call. A pinned call that finds the
+ * resource already destroyed fails like any other stale id. */
+HRESULT
+npt_resource_map(struct npt_context *ctx,
+                 uint64_t context_id, uint64_t resource_id,
+                 uint32_t subresource, uint32_t access_flags,
+                 uint32_t api_map_flags, uint32_t shmem_res_id,
+                 uint64_t read_range_begin,
+                 uint64_t read_range_end,
+                 uint64_t byte_size,
+                 uint32_t mip_height, uint32_t mip_depth,
+                 uint32_t shmem_offset,
+                 uint32_t *out_row_pitch, uint32_t *out_depth_pitch,
+                 uint32_t *out_mapped_size)
+{
+   struct npt_resource *pin = npt_context_pin_resource(ctx, shmem_res_id);
+   const HRESULT hr = npt_resource_map_pinned(ctx, context_id, resource_id, subresource, access_flags,
+                                              api_map_flags, shmem_res_id, read_range_begin,
+                                              read_range_end, byte_size, mip_height, mip_depth,
+                                              shmem_offset, out_row_pitch, out_depth_pitch,
+                                              out_mapped_size);
+   if (pin)
+      npt_context_free_detached_resource(pin);
+   return hr;
+}
+
+HRESULT
+npt_resource_unmap(struct npt_context *ctx,
+                   uint64_t context_id, uint64_t resource_id,
+                   uint32_t subresource, uint32_t shmem_res_id,
+                   uint32_t shmem_offset, uint64_t byte_size,
+                   uint32_t access_flags,
+                   uint64_t written_range_begin,
+                   uint64_t written_range_end)
+{
+   struct npt_resource *pin = npt_context_pin_resource(ctx, shmem_res_id);
+   const HRESULT hr = npt_resource_unmap_pinned(ctx, context_id, resource_id, subresource, shmem_res_id,
+                                                shmem_offset, byte_size, access_flags,
+                                                written_range_begin, written_range_end);
+   if (pin)
+      npt_context_free_detached_resource(pin);
+   return hr;
 }

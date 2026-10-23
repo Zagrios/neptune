@@ -63,6 +63,9 @@ npt_context_ring_monitor_fini(struct npt_context *ctx);
 static void
 npt_resource_free(struct npt_resource *res)
 {
+   if (atomic_fetch_sub(&res->refs, 1) != 1)
+      return;
+
    switch (res->fd_type) {
    case VIRGL_RESOURCE_FD_SHM:
       if (res->u.data && !res->iov_owned)
@@ -86,6 +89,19 @@ static void
 npt_context_free_resource(struct hash_entry *entry)
 {
    npt_resource_free(entry->data);
+}
+
+struct npt_resource *
+npt_context_pin_resource(struct npt_context *ctx, uint32_t res_id)
+{
+   mtx_lock(&ctx->resource_mutex);
+   const struct hash_entry *entry =
+      _mesa_hash_table_search(ctx->resource_table, &res_id);
+   struct npt_resource *res = entry ? entry->data : NULL;
+   if (res)
+      atomic_fetch_add(&res->refs, 1);
+   mtx_unlock(&ctx->resource_mutex);
+   return res;
 }
 
 void
@@ -1108,6 +1124,7 @@ npt_context_create_resource(struct npt_context *ctx,
          close(fd);
          return false;
       }
+      atomic_init(&res->refs, 1);
 
       res->res_id = res_id;
       res->fd_type = VIRGL_RESOURCE_FD_SHM;
@@ -1230,6 +1247,7 @@ npt_context_import_resource(struct npt_context *ctx,
    struct npt_resource *res = calloc(1, sizeof(*res));
    if (!res)
       return false;
+   atomic_init(&res->refs, 1);
 
    res->res_id = res_id;
    res->fd_type = fd_type;

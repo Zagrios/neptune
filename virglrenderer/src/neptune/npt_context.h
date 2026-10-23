@@ -8,6 +8,8 @@
 #ifndef NPT_CONTEXT_H
 #define NPT_CONTEXT_H
 
+#include <stdatomic.h>
+
 #include "npt_common.h"
 #include "npt_cs.h"
 #include "npt_event.h"
@@ -69,6 +71,10 @@ struct npt_resource {
     * completes the free.  Both fields are guarded by resource_mutex. */
    uint32_t heap_import_count;
    bool zombie;
+
+   /* The resource table owns one reference; a map/unmap pins another while it copies, so a guest
+    * destroy racing a queued ring command cannot munmap the slot under the copy. */
+   _Atomic uint32_t refs;
 };
 
 struct npt_context {
@@ -265,6 +271,10 @@ npt_context_destroy_resource(struct npt_context *ctx, uint32_t res_id);
  * munmap that was deferred while it was pinned. */
 void
 npt_context_free_detached_resource(struct npt_resource *res);
+
+/* Pin a resource across a copy; NULL if it is already destroyed. Drop with npt_context_free_detached_resource. */
+struct npt_resource *
+npt_context_pin_resource(struct npt_context *ctx, uint32_t res_id);
 
 static inline struct npt_resource *
 npt_context_get_resource(struct npt_context *ctx, uint32_t res_id)
