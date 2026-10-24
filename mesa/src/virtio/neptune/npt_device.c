@@ -70,7 +70,21 @@ npt_wrapper_cache_try_acquire_locked(void *wrapper)
       if (atomic_compare_exchange_weak(&com->base.pub_ref, &prev, prev + 1))
          return com;
    }
-   return NULL;
+   /* Obelisk: released by the app but kept by a private hold (a view
+    * holding its resource): hand it out again, taking the holds
+    * default_addref takes on 0->1.  Holds drop only under this mutex
+    * (npt_com_unhold), so the wrapper and its parent stay alive here. */
+   if (atomic_load(&com->base.holds) == 0)
+      return NULL;
+   atomic_fetch_add(&com->base.priv_ref, 1);
+   if (atomic_fetch_add(&com->base.pub_ref, 1) == 0) {
+      if (com->base.parent)
+         atomic_fetch_add(&com->base.parent->base.priv_ref, 1);
+   } else {
+      /* A concurrent AddRef took the 0->1 holds. */
+      atomic_fetch_sub(&com->base.priv_ref, 1);
+   }
+   return com;
 }
 
 void *

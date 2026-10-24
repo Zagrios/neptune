@@ -335,6 +335,42 @@ npt_com_force_destroy(struct npt_com_base *com)
       npt_com_destroy(com);
 }
 
+void
+npt_com_hold(void *self)
+{
+   struct npt_com_base *com = self;
+   /* The caller has a live reference, so the parent is alive too.  The
+    * hold keeps it alive as a live pub_ref would. */
+   atomic_fetch_add(&com->base.holds, 1);
+   atomic_fetch_add(&com->base.priv_ref, 1);
+   if (com->base.parent)
+      atomic_fetch_add(&com->base.parent->base.priv_ref, 1);
+}
+
+void
+npt_com_unhold(void *self)
+{
+   struct npt_com_base *com = self;
+   struct npt_com_base *parent = com->base.parent;
+   /* Under the cache mutex: a lookup that hands a released, held wrapper
+    * out again (npt_device.c) relies on the hold and its parent coupling
+    * staying in place while it takes its own. */
+   mtx_t *cache = com->base.device ? &com->base.device->wrapper_cache.mutex
+                                   : NULL;
+   if (cache)
+      mtx_lock(cache);
+   atomic_fetch_sub(&com->base.holds, 1);
+   const uint32_t priv = atomic_fetch_sub(&com->base.priv_ref, 1) - 1;
+   const uint32_t parent_priv =
+      parent ? atomic_fetch_sub(&parent->base.priv_ref, 1) - 1 : 1;
+   if (cache)
+      mtx_unlock(cache);
+   if (priv == 0 && atomic_load(&com->base.pub_ref) == 0)
+      npt_com_destroy(com);
+   if (parent_priv == 0 && atomic_load(&parent->base.pub_ref) == 0)
+      npt_com_destroy(parent);
+}
+
 void *
 npt_com_get_or_wrap_or_release(struct npt_device *dev, const GUID *iid,
                                uint64_t host_id,

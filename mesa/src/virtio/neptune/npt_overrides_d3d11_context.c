@@ -98,6 +98,259 @@ npt_d3d11_map_to_access_flags(D3D11_MAP map_type)
 
 
 /*
+ * Obelisk: render targets and viewports answered from what the game set.
+ *
+ * OMGetRenderTargets and RSGetViewports were wire round trips, each waiting for the host to drain the ring; Rocket
+ * League (UE3) saves and restores its render targets this way several times a frame, then asks each returned view for
+ * its resource and that resource for its description, more round trips each.  Each context wrapper records what it
+ * set.  Several wrappers can name one host context (D3D11CreateDevice's and GetImmediateContext1's, say), so a record
+ * answers only while its wrapper is the last one that changed that state on any context; otherwise the host answers,
+ * as before.  The views returned are the ones the game bound, as on Windows, and a record holds them privately as a
+ * D3D11 context holds what is bound to it.
+ */
+#define NPT_CTX_RTV_SLOTS 8
+#define NPT_CTX_VIEWPORTS 16
+
+struct npt_d3d11_context_aux {
+   bool om_known;
+   void *rtv[NPT_CTX_RTV_SLOTS];
+   void *dsv;
+   bool rs_known;
+   UINT viewport_count;
+   D3D11_VIEWPORT viewports[NPT_CTX_VIEWPORTS];
+};
+
+static atomic_flag npt_ctx_state_lock = ATOMIC_FLAG_INIT;
+static struct npt_d3d11_context_aux *npt_om_writer, *npt_rs_writer;
+
+static void
+npt_ctx_state_take(void)
+{
+   while (atomic_flag_test_and_set_explicit(&npt_ctx_state_lock, memory_order_acquire))
+      ;
+}
+
+static void
+npt_ctx_state_give(void)
+{
+   atomic_flag_clear_explicit(&npt_ctx_state_lock, memory_order_release);
+}
+
+static void
+npt_ctx_unhold_views(void *const *views, unsigned count)
+{
+   for (unsigned i = 0; i < count; i++)
+      if (views[i])
+         npt_com_unhold(views[i]);
+}
+
+static void
+npt_ctx_aux_destroy(void *aux_raw)
+{
+   struct npt_d3d11_context_aux *aux = aux_raw;
+   npt_ctx_state_take();
+   if (npt_om_writer == aux)
+      npt_om_writer = NULL;
+   if (npt_rs_writer == aux)
+      npt_rs_writer = NULL;
+   npt_ctx_state_give();
+   if (aux) {
+      npt_ctx_unhold_views(aux->rtv, NPT_CTX_RTV_SLOTS);
+      npt_ctx_unhold_views(&aux->dsv, 1);
+   }
+   free(aux);
+}
+
+static void
+npt_ctx_aux_init(struct npt_com_base *com, struct npt_device *dev, uint64_t host_id)
+{
+   (void)dev; (void)host_id;
+   com->aux_destroy = npt_ctx_aux_destroy;
+}
+
+/* known = false: this context changed its render targets in a way not mirrored here. */
+static void
+npt_ctx_record_om(void *self, bool known, UINT count, ID3D11RenderTargetView **rtvs, ID3D11DepthStencilView *dsv)
+{
+   struct npt_d3d11_context_aux *aux = ((struct npt_com_base *)self)->aux;
+   known = known && count <= NPT_CTX_RTV_SLOTS;
+   /* Only a known record names views.  The new ones are held before the old ones are let go, so a view in both
+    * survives. */
+   void *rtv[NPT_CTX_RTV_SLOTS] = {0}, *depth = NULL;
+   if (aux && known) {
+      for (unsigned i = 0; rtvs && i < count; i++)
+         if ((rtv[i] = rtvs[i]))
+            npt_com_hold(rtv[i]);
+      if ((depth = dsv))
+         npt_com_hold(depth);
+   }
+   npt_ctx_state_take();
+   if (aux) {
+      aux->om_known = known;
+      for (unsigned i = 0; i < NPT_CTX_RTV_SLOTS; i++) {
+         void *old = aux->rtv[i];
+         aux->rtv[i] = rtv[i];
+         rtv[i] = old;
+      }
+      void *old = aux->dsv;
+      aux->dsv = depth;
+      depth = old;
+   }
+   npt_om_writer = aux;
+   npt_ctx_state_give();
+   npt_ctx_unhold_views(rtv, NPT_CTX_RTV_SLOTS);
+   npt_ctx_unhold_views(&depth, 1);
+}
+
+static void
+npt_ctx_record_rs(void *self, bool known, UINT count, const D3D11_VIEWPORT *viewports)
+{
+   struct npt_d3d11_context_aux *aux = ((struct npt_com_base *)self)->aux;
+   npt_ctx_state_take();
+   if (aux) {
+      /* The host ignores more than 16 viewports, leaving the old ones. */
+      if (count > NPT_CTX_VIEWPORTS || (count && !viewports)) {
+         if (npt_rs_writer != aux)
+            aux->rs_known = false;
+      } else {
+         aux->rs_known = known;
+         aux->viewport_count = count;
+         if (count)
+            memcpy(aux->viewports, viewports, count * sizeof(*viewports));
+      }
+   }
+   npt_rs_writer = aux;
+   npt_ctx_state_give();
+}
+
+/* ClearState, and the command list calls that reset a context to it. */
+static void
+npt_ctx_record_cleared(void *self)
+{
+   npt_ctx_record_om(self, true, 0, NULL, NULL);
+   npt_ctx_record_rs(self, true, 0, NULL);
+}
+
+static void NPT_STDMETHODCALLTYPE
+ctx_OMSetRenderTargets_override(void *self, UINT NumViews, ID3D11RenderTargetView **ppRenderTargetViews,
+                                ID3D11DepthStencilView *pDepthStencilView)
+{
+   npt_ctx_record_om(self, true, NumViews, ppRenderTargetViews, pDepthStencilView);
+   npt_id3d11devicecontext_default_OMSetRenderTargets(self, NumViews, ppRenderTargetViews, pDepthStencilView);
+}
+
+static void NPT_STDMETHODCALLTYPE
+ctx_OMSetRenderTargetsAndUnorderedAccessViews_override(void *self, UINT NumRTVs,
+                                                       ID3D11RenderTargetView **ppRenderTargetViews,
+                                                       ID3D11DepthStencilView *pDepthStencilView, UINT UAVStartSlot,
+                                                       UINT NumUAVs, ID3D11UnorderedAccessView **ppUnorderedAccessViews,
+                                                       const UINT *pUAVInitialCounts)
+{
+   if (NumRTVs == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
+      /* Kept: still known only if this context set them last. */
+      struct npt_d3d11_context_aux *aux = ((struct npt_com_base *)self)->aux;
+      npt_ctx_state_take();
+      if (aux && npt_om_writer != aux)
+         aux->om_known = false;
+      npt_om_writer = aux;
+      npt_ctx_state_give();
+   } else {
+      /* The host unbinds render targets that overlap the new UAVs. */
+      bool uavs = false;
+      if (NumUAVs != D3D11_KEEP_UNORDERED_ACCESS_VIEWS && ppUnorderedAccessViews)
+         for (UINT i = 0; i < NumUAVs; i++)
+            uavs |= ppUnorderedAccessViews[i] != NULL;
+      npt_ctx_record_om(self, !uavs, NumRTVs, ppRenderTargetViews, pDepthStencilView);
+   }
+   npt_id3d11devicecontext_default_OMSetRenderTargetsAndUnorderedAccessViews(
+      self, NumRTVs, ppRenderTargetViews, pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
+      pUAVInitialCounts);
+}
+
+static bool
+npt_ctx_answer_om(void *self, UINT NumViews, ID3D11RenderTargetView **views, ID3D11DepthStencilView **depth)
+{
+   struct npt_d3d11_context_aux *aux = ((struct npt_com_base *)self)->aux;
+   npt_ctx_state_take();
+   const bool known = aux && aux->om_known && npt_om_writer == aux;
+   if (known) {
+      if (views)
+         for (UINT i = 0; i < NumViews; i++) {
+            void *v = i < NPT_CTX_RTV_SLOTS ? aux->rtv[i] : NULL;
+            if (v)
+               npt_com_default_addref(v);
+            views[i] = v;
+         }
+      if (depth) {
+         if (aux->dsv)
+            npt_com_default_addref(aux->dsv);
+         *depth = aux->dsv;
+      }
+   }
+   npt_ctx_state_give();
+   return known;
+}
+
+static void NPT_STDMETHODCALLTYPE
+ctx_RSSetViewports_override(void *self, UINT NumViewports, const D3D11_VIEWPORT *pViewports)
+{
+   npt_ctx_record_rs(self, true, NumViewports, pViewports);
+   npt_id3d11devicecontext_default_RSSetViewports(self, NumViewports, pViewports);
+}
+
+static void NPT_STDMETHODCALLTYPE
+ctx_RSGetViewports_override(void *self, UINT *pNumViewports, D3D11_VIEWPORT *pViewports)
+{
+   struct npt_d3d11_context_aux *aux = ((struct npt_com_base *)self)->aux;
+   npt_ctx_state_take();
+   const bool known = pNumViewports && aux && aux->rs_known && npt_rs_writer == aux;
+   if (known) {
+      /* As the host's RSGetViewports does. */
+      const UINT available = aux->viewport_count, requested = *pNumViewports;
+      if (pViewports) {
+         for (UINT i = 0; i < requested; i++) {
+            if (i < available)
+               pViewports[i] = aux->viewports[i];
+            else
+               memset(&pViewports[i], 0, sizeof(pViewports[i]));
+         }
+         *pNumViewports = available < requested ? available : requested;
+      } else {
+         *pNumViewports = available;
+      }
+   }
+   npt_ctx_state_give();
+   if (!known)
+      npt_id3d11devicecontext_default_RSGetViewports(self, pNumViewports, pViewports);
+}
+
+static void NPT_STDMETHODCALLTYPE
+ctx1_SwapDeviceContextState_override(void *self, ID3DDeviceContextState *pState,
+                                     ID3DDeviceContextState **ppPreviousState)
+{
+   npt_ctx_record_om(self, false, 0, NULL, NULL);
+   npt_ctx_record_rs(self, false, 0, NULL);
+   npt_id3d11devicecontext1_default_SwapDeviceContextState(self, pState, ppPreviousState);
+}
+
+static void NPT_STDMETHODCALLTYPE
+ctx_ExecuteCommandList_override(void *self, ID3D11CommandList *pCommandList, BOOL RestoreContextState)
+{
+   if (!RestoreContextState)
+      npt_ctx_record_cleared(self);
+   npt_id3d11devicecontext_default_ExecuteCommandList(self, pCommandList, RestoreContextState);
+}
+
+static HRESULT NPT_STDMETHODCALLTYPE
+ctx_FinishCommandList_override(void *self, BOOL RestoreDeferredContextState, ID3D11CommandList **ppCommandList)
+{
+   if (!RestoreDeferredContextState)
+      npt_ctx_record_cleared(self);
+   return npt_id3d11devicecontext_default_FinishCommandList(self, RestoreDeferredContextState, ppCommandList);
+}
+
+
+/*
  * Obelisk: deferred, ranged sync of dynamic vertex and index buffers.
  *
  * The rename-ring path ships the whole buffer at every Unmap. Rocket League (UE3) streams its immediate-mode geometry
@@ -698,6 +951,7 @@ ctx_ClearState_override(void *self)
          npt_defer_track(&c->vb[i], NULL);
       npt_defer_track(&c->ib, NULL);
    }
+   npt_ctx_record_cleared(self);
    npt_id3d11devicecontext_default_ClearState(self);
 }
 
@@ -1075,6 +1329,8 @@ ctx_OMGetRenderTargets_override(void *self, UINT NumViews,
                                ID3D11RenderTargetView **views,
                                ID3D11DepthStencilView **depth)
 {
+   if (npt_ctx_answer_om(self, NumViews, views, depth))
+      return;
    npt_id3d11devicecontext_default_OMGetRenderTargets(self, NumViews,
                                                    views, depth);
    if (views) {
@@ -1112,6 +1368,14 @@ npt_overrides_d3d11_context_init(void)
    NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(GetData, ctx_GetData_override);
    NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(OMGetRenderTargets,
                                              ctx_OMGetRenderTargets_override);
+   NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(OMSetRenderTargets, ctx_OMSetRenderTargets_override);
+   NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(OMSetRenderTargetsAndUnorderedAccessViews,
+                                             ctx_OMSetRenderTargetsAndUnorderedAccessViews_override);
+   NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(RSSetViewports, ctx_RSSetViewports_override);
+   NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(RSGetViewports, ctx_RSGetViewports_override);
+   NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT1(SwapDeviceContextState, ctx1_SwapDeviceContextState_override);
+   NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(ExecuteCommandList, ctx_ExecuteCommandList_override);
+   NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(FinishCommandList, ctx_FinishCommandList_override);
 
-   npt_com_register_family(context_tiers, 0, NULL);
+   npt_com_register_family(context_tiers, sizeof(struct npt_d3d11_context_aux), npt_ctx_aux_init);
 }

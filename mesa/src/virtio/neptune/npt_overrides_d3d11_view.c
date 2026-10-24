@@ -43,7 +43,29 @@ struct npt_d3d11_view_aux {
     * IID_ID3D11Resource (e.g. views constructed outside our
     * Create*View overrides). */
    const GUID *resource_iid;
+   /* Obelisk: the resource wrapper the view was created from, held
+    * privately like a D3D11 view holds its resource, so GetResource
+    * answers without a host round trip.  NULL for views that came
+    * from a context state query. */
+   void *resource;
 };
+
+static void
+view_aux_destroy(void *aux_raw)
+{
+   struct npt_d3d11_view_aux *aux = aux_raw;
+   if (aux && aux->resource)
+      npt_com_unhold(aux->resource);
+   free(aux);
+}
+
+static void
+view_aux_init(struct npt_com_base *com, struct npt_device *dev,
+              uint64_t host_id)
+{
+   (void)dev; (void)host_id;
+   com->aux_destroy = view_aux_destroy;
+}
 
 
 /* Map a resource wrapper's lpVtbl back to its concrete IID. */
@@ -78,6 +100,10 @@ view_record_resource_iid(void *view, void *pResource)
    if (!aux)
       return;
    aux->resource_iid = view_iid_for_resource_wrapper(pResource);
+   if (pResource && !aux->resource) {
+      npt_com_hold(pResource);
+      aux->resource = pResource;
+   }
 }
 
 
@@ -119,6 +145,13 @@ VIEW_CREATE_OVERRIDE(id3d11device3, CreateUnorderedAccessView1,
 static void NPT_STDMETHODCALLTYPE
 view_GetResource_override(void *self, ID3D11Resource **ppResource)
 {
+   struct npt_d3d11_view_aux *own = ((struct npt_com_base *)self)->aux;
+   if (ppResource && own && own->resource) {
+      npt_com_default_addref(own->resource);
+      *ppResource = own->resource;
+      return;
+   }
+
    ID3D11Resource *raw = NULL;
    ID3D11Resource **redirect = ppResource ? &raw : NULL;
 
@@ -256,5 +289,5 @@ npt_overrides_d3d11_view_init(void)
 
    npt_com_register_family(view_tiers,
                            sizeof(struct npt_d3d11_view_aux),
-                           NULL);  /* default-zero aux is fine */
+                           view_aux_init);
 }

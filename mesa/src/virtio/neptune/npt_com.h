@@ -169,6 +169,17 @@ void
 npt_com_force_destroy(struct npt_com_base *com);
 
 /*
+ * Obelisk: a private hold keeps a wrapper and its parent alive without
+ * changing the refcount the application sees, as D3D11 objects
+ * referencing each other do (a view holds its resource, a context what
+ * is bound to it).  The caller must have a live reference to hold.
+ * Dropping the last hold of a wrapper the application already released
+ * destroys it.
+ */
+void npt_com_hold(void *self);
+void npt_com_unhold(void *self);
+
+/*
  * Satisfy QueryInterface without a host round-trip by matching `riid`
  * against a NULL-terminated chain of parent IIDs.  On match, bumps
  * refcount and writes *out = self.  E_NOINTERFACE on miss; caller

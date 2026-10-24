@@ -28,6 +28,10 @@ struct npt_object {
    uint64_t id;
    _Atomic uint32_t pub_ref;
    _Atomic uint32_t priv_ref;
+   /* Obelisk: private holds (npt_com_hold), each also counted in
+    * priv_ref.  A held wrapper the app released stays in the wrapper
+    * cache and a lookup hands it out again. */
+   _Atomic uint32_t holds;
    struct npt_device *device;
    struct npt_com_base *parent;
    /* Non-NULL for single-threaded-per-instance interfaces (DC*, SC*)
@@ -67,6 +71,7 @@ npt_object_init(struct npt_object *obj, uint64_t host_id,
     * cache-lookup observer; ARM64 needs the explicit barrier. */
    atomic_store_explicit(&obj->pub_ref, 1, memory_order_release);
    atomic_store_explicit(&obj->priv_ref, 0, memory_order_relaxed);
+   atomic_store_explicit(&obj->holds, 0, memory_order_relaxed);
    obj->device = device;
    obj->parent = NULL;
    obj->instance_ring = NULL;

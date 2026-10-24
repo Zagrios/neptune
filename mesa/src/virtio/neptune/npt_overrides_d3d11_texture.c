@@ -58,6 +58,21 @@ tex2d_GetDesc_override(void *self, D3D11_TEXTURE2D_DESC *pDesc)
       return;
    }
    npt_id3d11texture2d_default_GetDesc(self, pDesc);
+   /* Obelisk: a texture's description never changes; keep the host's
+    * answer so the next GetDesc (a swapchain buffer's, every frame)
+    * needs no round trip.  Only for textures the CPU cannot map: the
+    * cached description also steers Map. */
+   const struct npt_d3d11_texture_desc d = {
+      .width = pDesc->Width, .height = pDesc->Height, .depth = 1,
+      .mip_levels = pDesc->MipLevels, .array_size = pDesc->ArraySize,
+      .format = pDesc->Format, .sample_count = pDesc->SampleDesc.Count,
+      .sample_quality = pDesc->SampleDesc.Quality, .usage = pDesc->Usage,
+      .bind_flags = pDesc->BindFlags,
+      .cpu_access_flags = pDesc->CPUAccessFlags,
+      .misc_flags = pDesc->MiscFlags,
+   };
+   if (pDesc->Width && !pDesc->CPUAccessFlags && npt_d3d11_texture_cast(t))
+      npt_d3d11_texture_set_desc(t, &d);
 }
 
 static void NPT_STDMETHODCALLTYPE
