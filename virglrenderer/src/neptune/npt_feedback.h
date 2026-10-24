@@ -106,6 +106,7 @@ struct npt_feedback_entry {
 struct npt_feedback_state {
    mtx_t mutex;
    struct hash_table *table;       /* obj_id -> npt_feedback_entry */
+   struct hash_table *by_host;     /* resolved host_obj -> npt_feedback_entry */
 
    struct list_head pending;
    uint32_t pending_count;

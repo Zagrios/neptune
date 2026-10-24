@@ -37,10 +37,16 @@ struct npt_d3d11_query_aux {
    /* Bytes for the host to memcpy each successful poll. */
    uint32_t query_data_size;
 
-   /* Bumped at each Begin before the slot is cleared; host stamps
-    * the version so a GetData racing a stale write from the previous
-    * cycle sees a mismatch and returns S_FALSE. */
+   /* Bumped at each End before the slot is cleared, as the host bumps
+    * its own count at End; the host stamps its count with each result,
+    * so a slot still holding an earlier cycle's result reads as a
+    * mismatch and GetData returns S_FALSE. */
    _Atomic uint32_t local_version;
+
+   /* When the last End was issued (npt_profile_now_ns), and the cycle
+    * GetData last asked the host to flush for. */
+   uint64_t end_ns;
+   uint32_t flushed_version;
 };
 
 /* Type-safe downcast from an ID3D11Asynchronous (or any tier in the

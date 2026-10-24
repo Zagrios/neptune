@@ -13,6 +13,7 @@
 #include "npt_device.h"
 #include "npt_dispatch.h"
 #include "npt_overrides.h"
+#include "npt_profile.h"
 #include "npt_resource.h"
 #include "npt_ring.h"
 
@@ -965,12 +966,17 @@ ctx_query_slot(struct npt_d3d11_query_aux *aux)
       ((uint8_t *)aux->base.fb_shmem->mmap_ptr + aux->base.fb_offset);
 }
 
+/* A query whose result has not reached its slot this long after End asks
+ * the host instead: an End on a deferred context, which the host does not
+ * poll, or a registration the host refused. */
+#define NPT_QUERY_LOCAL_WAIT_NS (50ull * 1000 * 1000)
+
 static void NPT_STDMETHODCALLTYPE
-ctx_Begin_override(void *self, ID3D11Asynchronous *pAsync)
+ctx_End_override(void *self, ID3D11Asynchronous *pAsync)
 {
    struct npt_d3d11_query_aux *aux = npt_d3d11_query_aux_cast(pAsync);
    if (aux && aux->base.registered) {
-      /* Bump version + clear flag BEFORE the wire Begin so a racing
+      /* Bump version + clear flag BEFORE the wire End so a racing
        * guest GetData sees flag=0 or a version mismatch (S_FALSE).
        * "New version + old result" is impossible: host writes flag=1
        * only after the result with release ordering. */
@@ -981,21 +987,53 @@ ctx_Begin_override(void *self, ID3D11Asynchronous *pAsync)
          atomic_store_explicit(&slot->state, ((uint64_t)v) << 32,
                                memory_order_release);
       }
+      aux->end_ns = npt_profile_now_ns();
    }
-   npt_id3d11devicecontext_default_Begin(self, pAsync);
+   npt_id3d11devicecontext_default_End(self, pAsync);
 }
 
+/* Obelisk: GetData reads the result the host poll left in the query's
+ * slot, instead of a wire round trip that waits for the host to drain
+ * the ring each time (Rocket League polls queries every frame). */
 static HRESULT NPT_STDMETHODCALLTYPE
 ctx_GetData_override(void *self, ID3D11Asynchronous *pAsync, void *pData,
                      UINT DataSize, UINT GetDataFlags)
 {
-   /* The pinned host publishes version zero for every query cycle.
-    * Reading its shared slot cannot distinguish Begin/End generations,
-    * and rejecting version zero after Begin makes DONOTFLUSH spin forever.
-    * Ask the real host for the result on every call, preserving the flags.
-    * This also avoids serving stale cached results for End-only queries. */
-   return npt_id3d11devicecontext_default_GetData(self, pAsync, pData,
-                                                DataSize, GetDataFlags);
+   struct npt_d3d11_query_aux *aux = npt_d3d11_query_aux_cast(pAsync);
+   struct npt_query_feedback_slot *slot = ctx_query_slot(aux);
+   if (!slot || !aux->base.registered)
+      /* Counter, OOM at Create, or QI-routed wrapper. */
+      return npt_id3d11devicecontext_default_GetData(self, pAsync, pData,
+                                                     DataSize, GetDataFlags);
+
+   const uint64_t s = atomic_load_explicit(&slot->state,
+                                           memory_order_acquire);
+   const uint32_t flag = (uint32_t)(s & 0xFFFFFFFFu);
+   const uint32_t version = (uint32_t)(s >> 32);
+   const uint32_t expected =
+      atomic_load_explicit(&aux->local_version, memory_order_relaxed);
+
+   if (flag == NPT_QUERY_FEEDBACK_FLAG_READY && version == expected) {
+      if (pData && DataSize) {
+         const UINT copy = DataSize <= aux->query_data_size ?
+                           DataSize : aux->query_data_size;
+         memcpy(pData, slot->result, copy);
+      }
+      return NPT_S_OK;
+   }
+
+   if (npt_profile_now_ns() - aux->end_ns > NPT_QUERY_LOCAL_WAIT_NS)
+      return npt_id3d11devicecontext_default_GetData(self, pAsync, pData,
+                                                     DataSize, GetDataFlags);
+
+   /* Without DONOTFLUSH, D3D11 flushes so the query can complete: once
+    * per cycle is enough, the poll publishes the result. */
+   if (!(GetDataFlags & 0x1u /* D3D11_ASYNC_GETDATA_DONOTFLUSH */) &&
+       aux->flushed_version != expected) {
+      aux->flushed_version = expected;
+      npt_id3d11devicecontext_default_Flush(self);
+   }
+   return NPT_S_FALSE;
 }
 
 /* CopyFlags hints (DISCARD, NO_OVERWRITE) are advisory in the host
@@ -1070,7 +1108,7 @@ npt_overrides_d3d11_context_init(void)
                                                ctx_UpdateSubresource_override);
    NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT1(UpdateSubresource1,
                                                ctx_UpdateSubresource1_override);
-   NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(Begin,   ctx_Begin_override);
+   NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(End,     ctx_End_override);
    NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(GetData, ctx_GetData_override);
    NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(OMGetRenderTargets,
                                              ctx_OMGetRenderTargets_override);

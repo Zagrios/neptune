@@ -55,6 +55,42 @@ npt_feedback_init(struct npt_context *ctx)
    mtx_init(&st->mutex, mtx_plain);
    list_inithead(&st->pending);
    st->table = _mesa_hash_table_create(NULL, fb_hash_u64, fb_equal_u64);
+   st->by_host = _mesa_pointer_hash_table_create(NULL);
+}
+
+/* End and Signal name their object by host pointer: by_host finds its entry without walking the table.  Caller holds
+ * the state lock. */
+static void
+fb_unbind_host_obj_locked(struct npt_feedback_state *st,
+                          struct npt_feedback_entry *entry)
+{
+   if (!entry->host_obj)
+      return;
+   if (st->by_host) {
+      struct hash_entry *he = _mesa_hash_table_search(st->by_host, entry->host_obj);
+      if (he && he->data == entry)
+         _mesa_hash_table_remove(st->by_host, he);
+   }
+   entry->host_obj = NULL;
+}
+
+static void
+fb_bind_host_obj_locked(struct npt_feedback_state *st,
+                        struct npt_feedback_entry *entry, void *host_obj)
+{
+   fb_unbind_host_obj_locked(st, entry);
+   entry->host_obj = host_obj;
+   if (host_obj && st->by_host)
+      _mesa_hash_table_insert(st->by_host, host_obj, entry);
+}
+
+static struct npt_feedback_entry *
+fb_find_by_host_obj_locked(struct npt_feedback_state *st, void *host_obj)
+{
+   if (!st->by_host || !host_obj)
+      return NULL;
+   struct hash_entry *he = _mesa_hash_table_search(st->by_host, host_obj);
+   return he ? he->data : NULL;
 }
 
 void
@@ -70,6 +106,8 @@ npt_feedback_fini(struct npt_context *ctx)
    }
    _mesa_hash_table_destroy(st->table, NULL);
    st->table = NULL;
+   _mesa_hash_table_destroy(st->by_host, NULL);
+   st->by_host = NULL;
    list_inithead(&st->pending);
    st->pending_count = 0;
    mtx_unlock(&st->mutex);
@@ -105,12 +143,8 @@ npt_feedback_lookup_by_host_obj_locked(struct npt_context *ctx,
    if (!st->table || !host_obj)
       return NULL;
 
-   hash_table_foreach(st->table, e) {
-      struct npt_feedback_entry *entry = e->data;
-      if (entry->type == type && entry->host_obj == host_obj)
-         return entry;
-   }
-   return NULL;
+   struct npt_feedback_entry *entry = fb_find_by_host_obj_locked(st, host_obj);
+   return entry && entry->type == type ? entry : NULL;
 }
 
 void
@@ -163,7 +197,7 @@ npt_feedback_register_locked(struct npt_context *ctx,
       entry->fb_res_id = fb_res_id;
       entry->fb_offset = fb_offset;
       entry->slot_size = slot_size;
-      entry->host_obj = NULL;
+      fb_unbind_host_obj_locked(st, entry);
       entry->host_ctx = NULL;
       entry->cookie = 0;
       entry->version = 0;
@@ -208,6 +242,7 @@ npt_feedback_unregister(struct npt_context *ctx, uint64_t obj_id)
    if (e) {
       struct npt_feedback_entry *entry = e->data;
       npt_feedback_clear_pending_locked(ctx, entry);
+      fb_unbind_host_obj_locked(st, entry);
       _mesa_hash_table_remove(st->table, e);
       free(entry);
    }
@@ -387,21 +422,27 @@ npt_feedback_query_mark_end(struct npt_context *ctx,
    if (!ctx->feedback.table)
       return;
 
+   /* Results are polled on the immediate context only: GetData on a deferred one is invalid, and its End runs at
+    * ExecuteCommandList, not here. */
+   PFN_ID3D11DeviceContext_GetType get_type =
+      NPT_COM_VTBL_FUNC(PFN_ID3D11DeviceContext_GetType,
+                        npt_com_vtable(host_ctx),
+                        NPT_VTBL_ID3D11DeviceContext_GetType);
+   const bool immediate = get_type(host_ctx) == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+
    npt_feedback_state_lock(ctx);
-   /* Linear scan: registered query counts are small in practice. */
-   struct npt_feedback_entry *match = NULL;
-   hash_table_foreach(ctx->feedback.table, e) {
-      struct npt_feedback_entry *entry = e->data;
-      if (entry->type != NPT_FEEDBACK_TYPE_QUERY)
-         continue;
-      if (entry->host_obj == host_query) {
-         match = entry;
-         break;
-      }
-      /* Resolve host_obj from guest_id on first encounter. */
-      if (!entry->host_obj) {
-         entry->host_obj = npt_context_lookup_object(
-            ctx, NULL, entry->obj_id, NPT_OBJECT_TYPE_IUNKNOWN);
+   struct npt_feedback_state *st = &ctx->feedback;
+   struct npt_feedback_entry *match = fb_find_by_host_obj_locked(st, host_query);
+   if (match && match->type != NPT_FEEDBACK_TYPE_QUERY)
+      match = NULL;
+   if (!match) {
+      /* First End of a query: resolve host_obj from guest_id. */
+      hash_table_foreach(st->table, e) {
+         struct npt_feedback_entry *entry = e->data;
+         if (entry->type != NPT_FEEDBACK_TYPE_QUERY || entry->host_obj)
+            continue;
+         fb_bind_host_obj_locked(st, entry, npt_context_lookup_object(
+            ctx, NULL, entry->obj_id, NPT_OBJECT_TYPE_IUNKNOWN));
          if (entry->host_obj == host_query) {
             match = entry;
             break;
@@ -409,16 +450,20 @@ npt_feedback_query_mark_end(struct npt_context *ctx,
       }
    }
    if (match) {
-      if (!match->host_ctx)
+      /* The guest counts its Ends the same way (ctx_End_override): the slot's version names the End its result
+       * answers. */
+      match->version++;
+      if (immediate) {
          match->host_ctx = host_ctx;
-      npt_feedback_set_pending_locked(ctx, match);
+         npt_feedback_set_pending_locked(ctx, match);
+      }
    }
    npt_feedback_state_unlock(ctx);
 
    /* Only a ring thread polls, and it may be parked; tell it a poll is
     * owed.  After the state unlock: npt_ring_notify_feedback() takes
     * ring->mutex, which the poll path nests the other way round. */
-   if (match)
+   if (match && immediate)
       npt_context_notify_rings_feedback(ctx);
 }
 
@@ -483,15 +528,10 @@ npt_feedback_fence_mark_signal(struct npt_context *ctx, void *host_fence,
    /* Fast path: entry's host_obj already resolved (every Signal
     * after the first hits this).  Both fence types share one host
     * pointer namespace, so scan for either. */
-   struct npt_feedback_entry *entry = NULL;
-   hash_table_foreach(ctx->feedback.table, e) {
-      struct npt_feedback_entry *cand = e->data;
-      if (npt_feedback_type_is_fence(cand->type) &&
-          cand->host_obj == host_fence) {
-         entry = cand;
-         break;
-      }
-   }
+   struct npt_feedback_entry *entry =
+      fb_find_by_host_obj_locked(&ctx->feedback, host_fence);
+   if (entry && !npt_feedback_type_is_fence(entry->type))
+      entry = NULL;
    if (!entry) {
       /* First-time resolve: fence registered before any Signal hasn't
        * had host_obj cached.  Walk fence entries with NULL host_obj
@@ -501,8 +541,8 @@ npt_feedback_fence_mark_signal(struct npt_context *ctx, void *host_fence,
          struct npt_feedback_entry *cand = e->data;
          if (!npt_feedback_type_is_fence(cand->type) || cand->host_obj)
             continue;
-         cand->host_obj = npt_context_lookup_object(
-            ctx, NULL, cand->obj_id, NPT_OBJECT_TYPE_IUNKNOWN);
+         fb_bind_host_obj_locked(&ctx->feedback, cand, npt_context_lookup_object(
+            ctx, NULL, cand->obj_id, NPT_OBJECT_TYPE_IUNKNOWN));
          if (cand->host_obj == host_fence) {
             entry = cand;
             break;

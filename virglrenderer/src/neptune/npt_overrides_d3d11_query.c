@@ -2,11 +2,12 @@
  * Copyright 2026 Turing Software LLC
  * SPDX-License-Identifier: MIT
  *
- * Host-side ID3D11DeviceContext::End hook that queues the query's
- * feedback entry for the next poll.  Begin and GetData need no host
- * hook: the guest bumps the slot version at Begin so a stale-flag
- * observation hits a version mismatch (S_FALSE), and the guest's
- * local GetData reads the feedback slot directly.
+ * Host-side ID3D11DeviceContext::End hook that counts the query's
+ * cycle and queues its feedback entry for the next poll.  Begin and
+ * GetData need no host hook: guest and host both bump the version at
+ * End, so a slot still holding an earlier End's result reads as a
+ * version mismatch (S_FALSE), and the guest's local GetData reads the
+ * feedback slot directly.
  */
 
 #include "npt_context.h"
@@ -23,10 +24,8 @@ npt_override_DC_End(struct npt_dispatch_context *dctx,
 {
    original(args->_self, args->pAsync);
 
-   /* args->pAsync is the host pointer; the registry indexes by
-    * guest-allocated id, so mark_end walks the registry once to
-    * locate the matching entry.  Linear in registered query count,
-    * which is small in practice. */
+   /* args->pAsync is the host pointer; mark_end finds its entry by
+    * host pointer, resolved from the guest id at the first End. */
    struct npt_context *ctx = npt_context_from_dispatch(dctx);
    if (!ctx)
       return;
