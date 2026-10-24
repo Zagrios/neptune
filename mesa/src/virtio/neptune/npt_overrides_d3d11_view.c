@@ -48,6 +48,10 @@ struct npt_d3d11_view_aux {
     * answers without a host round trip.  NULL for views that came
     * from a context state query. */
    void *resource;
+   /* Obelisk: the description the host gave the first GetDesc (a view
+    * never changes), answered locally afterwards.  desc_size 0: none yet. */
+   uint8_t desc_size;
+   uint8_t desc[64];
 };
 
 static void
@@ -211,6 +215,33 @@ view_GetResource_override(void *self, ID3D11Resource **ppResource)
 }
 
 
+/* Obelisk: GetDesc asks the host once per view, then answers from the
+ * view's aux. */
+#define VIEW_GETDESC_OVERRIDE(LOWER, DESC_T)                                \
+static void NPT_STDMETHODCALLTYPE                                          \
+LOWER##_GetDesc_override(void *self, DESC_T *pDesc)                        \
+{                                                                          \
+   _Static_assert(sizeof(DESC_T) <= 64, "view desc cache too small");      \
+   struct npt_d3d11_view_aux *aux = ((struct npt_com_base *)self)->aux;    \
+   if (!pDesc)                                                             \
+      return;                                                              \
+   if (aux && aux->desc_size == sizeof(DESC_T)) {                          \
+      memcpy(pDesc, aux->desc, sizeof(DESC_T));                            \
+      return;                                                              \
+   }                                                                       \
+   npt_##LOWER##_default_GetDesc(self, pDesc);                             \
+   if (aux) {                                                              \
+      memcpy(aux->desc, pDesc, sizeof(DESC_T));                            \
+      aux->desc_size = sizeof(DESC_T);                                     \
+   }                                                                       \
+}
+
+VIEW_GETDESC_OVERRIDE(id3d11rendertargetview,    D3D11_RENDER_TARGET_VIEW_DESC)
+VIEW_GETDESC_OVERRIDE(id3d11depthstencilview,    D3D11_DEPTH_STENCIL_VIEW_DESC)
+VIEW_GETDESC_OVERRIDE(id3d11shaderresourceview,  D3D11_SHADER_RESOURCE_VIEW_DESC)
+VIEW_GETDESC_OVERRIDE(id3d11unorderedaccessview, D3D11_UNORDERED_ACCESS_VIEW_DESC)
+
+
 /* All view tiers share one aux (allocated by the runtime via
  * npt_com_register_family).  Listing every concrete tier here is
  * cheap and means each derived wrapper carries the resource-IID
@@ -286,6 +317,21 @@ npt_overrides_d3d11_view_init(void)
                          view_GetResource_override);
    NPT_REGISTER_OVERRIDE(id3d11unorderedaccessview1,   GetResource,
                          view_GetResource_override);
+
+   NPT_REGISTER_OVERRIDE(id3d11rendertargetview,     GetDesc,
+                         id3d11rendertargetview_GetDesc_override);
+   NPT_REGISTER_OVERRIDE(id3d11rendertargetview1,    GetDesc,
+                         id3d11rendertargetview_GetDesc_override);
+   NPT_REGISTER_OVERRIDE(id3d11depthstencilview,     GetDesc,
+                         id3d11depthstencilview_GetDesc_override);
+   NPT_REGISTER_OVERRIDE(id3d11shaderresourceview,   GetDesc,
+                         id3d11shaderresourceview_GetDesc_override);
+   NPT_REGISTER_OVERRIDE(id3d11shaderresourceview1,  GetDesc,
+                         id3d11shaderresourceview_GetDesc_override);
+   NPT_REGISTER_OVERRIDE(id3d11unorderedaccessview,  GetDesc,
+                         id3d11unorderedaccessview_GetDesc_override);
+   NPT_REGISTER_OVERRIDE(id3d11unorderedaccessview1, GetDesc,
+                         id3d11unorderedaccessview_GetDesc_override);
 
    npt_com_register_family(view_tiers,
                            sizeof(struct npt_d3d11_view_aux),
