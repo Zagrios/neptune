@@ -596,6 +596,7 @@ npt_gsc_init(struct npt_guest_swapchain_common *c, struct npt_com_base *com,
    mtx_init(&c->present_mutex, mtx_plain);
    mtx_init(&c->output_lock, mtx_plain);
    mtx_init(&c->wsi_mutex, mtx_plain);
+   mtx_init(&c->private_lock, mtx_plain);
    cnd_init(&c->wsi_cond);
    /* Auto-reset: an unconsumed signal latches, so a release that races
     * the reuse gate's inflight check is not lost. */
@@ -645,6 +646,17 @@ npt_gsc_init(struct npt_guest_swapchain_common *c, struct npt_com_base *com,
       c->desc.SampleDesc.Count = 1;
 }
 
+struct npt_gsc_private {
+   struct npt_gsc_private *next;
+   GUID name;
+   /* Held reference for SetPrivateDataInterface; data then holds it. */
+   IUnknown *unknown;
+   UINT size;
+   unsigned char data[];
+};
+
+static void npt_gsc_private_free(struct npt_gsc_private *entry);
+
 void
 npt_gsc_fini(struct npt_guest_swapchain_common *c)
 {
@@ -652,6 +664,12 @@ npt_gsc_fini(struct npt_guest_swapchain_common *c)
    mtx_destroy(&c->wsi_mutex);
    mtx_destroy(&c->present_mutex);
    mtx_destroy(&c->output_lock);
+   while (c->private_data) {
+      struct npt_gsc_private *entry = c->private_data;
+      c->private_data = entry->next;
+      npt_gsc_private_free(entry);
+   }
+   mtx_destroy(&c->private_lock);
    /* Workers joined by the WSI teardown, so these are unreferenced. */
    if (c->image_release_evt)
       CloseHandle(c->image_release_evt);
@@ -683,30 +701,110 @@ npt_gsc_Release(void *self)
    return npt_com_default_release(self);
 }
 
+struct npt_gsc_unknown_vtbl {
+   void *QueryInterface;
+   ULONG (NPT_STDMETHODCALLTYPE *AddRef)(void *self);
+   ULONG (NPT_STDMETHODCALLTYPE *Release)(void *self);
+};
+
+static const struct npt_gsc_unknown_vtbl *
+npt_gsc_unknown(const IUnknown *unknown)
+{
+   return *(const struct npt_gsc_unknown_vtbl *const *)unknown;
+}
+
+static void
+npt_gsc_private_free(struct npt_gsc_private *entry)
+{
+   if (entry->unknown)
+      npt_gsc_unknown(entry->unknown)->Release(entry->unknown);
+   free(entry);
+}
+
+/* Replaces Name's entry with size bytes of data, or removes it when data
+ * is NULL; unknown is the interface data holds, AddRef'd here. */
+static HRESULT
+npt_gsc_private_set(void *self, const GUID *Name, UINT size,
+                    const void *data, const IUnknown *unknown)
+{
+   if (!Name)
+      return NPT_E_INVALIDARG;
+   struct npt_guest_swapchain_common *c = npt_gsc(self);
+   struct npt_gsc_private *entry = NULL;
+   if (data) {
+      entry = malloc(sizeof(*entry) + size);
+      if (!entry)
+         return NPT_E_OUTOFMEMORY;
+      entry->name = *Name;
+      entry->size = size;
+      memcpy(entry->data, data, size);
+      entry->unknown = (IUnknown *)unknown;
+      if (unknown)
+         npt_gsc_unknown(unknown)->AddRef((void *)unknown);
+   }
+   mtx_lock(&c->private_lock);
+   struct npt_gsc_private **link = &c->private_data;
+   while (*link && memcmp(&(*link)->name, Name, sizeof(*Name)))
+      link = &(*link)->next;
+   struct npt_gsc_private *old = *link;
+   if (old)
+      *link = old->next;
+   if (entry) {
+      entry->next = c->private_data;
+      c->private_data = entry;
+   }
+   mtx_unlock(&c->private_lock);
+   if (old)
+      npt_gsc_private_free(old);
+   return NPT_S_OK;
+}
+
 HRESULT NPT_STDMETHODCALLTYPE
 npt_gsc_SetPrivateData(void *self, const GUID *Name, UINT DataSize,
                        const void *pData)
 {
-   (void)self; (void)Name; (void)DataSize; (void)pData;
-   return NPT_S_OK;
+   return npt_gsc_private_set(self, Name, DataSize, DataSize ? pData : NULL,
+                              NULL);
 }
 
 HRESULT NPT_STDMETHODCALLTYPE
 npt_gsc_SetPrivateDataInterface(void *self, const GUID *Name,
                                 const IUnknown *pUnknown)
 {
-   (void)self; (void)Name; (void)pUnknown;
-   return NPT_S_OK;
+   return npt_gsc_private_set(self, Name, sizeof(pUnknown),
+                              pUnknown ? &pUnknown : NULL, pUnknown);
 }
 
 HRESULT NPT_STDMETHODCALLTYPE
 npt_gsc_GetPrivateData(void *self, const GUID *Name, UINT *pDataSize,
                        void *pData)
 {
-   (void)self; (void)Name; (void)pData;
-   if (pDataSize)
+   if (!Name || !pDataSize)
+      return NPT_E_INVALIDARG;
+   struct npt_guest_swapchain_common *c = npt_gsc(self);
+   HRESULT hr = NPT_DXGI_ERROR_NOT_FOUND;
+   mtx_lock(&c->private_lock);
+   struct npt_gsc_private *entry = c->private_data;
+   while (entry && memcmp(&entry->name, Name, sizeof(*Name)))
+      entry = entry->next;
+   if (!entry) {
       *pDataSize = 0;
-   return NPT_DXGI_ERROR_NOT_FOUND;
+   } else if (!pData) {
+      *pDataSize = entry->size;
+      hr = NPT_S_OK;
+   } else if (*pDataSize < entry->size) {
+      *pDataSize = entry->size;
+      hr = NPT_DXGI_ERROR_MORE_DATA;
+   } else {
+      *pDataSize = entry->size;
+      memcpy(pData, entry->data, entry->size);
+      /* Like DXGI, a read interface comes with its own reference. */
+      if (entry->unknown)
+         npt_gsc_unknown(entry->unknown)->AddRef(entry->unknown);
+      hr = NPT_S_OK;
+   }
+   mtx_unlock(&c->private_lock);
+   return hr;
 }
 
 /* ------------------------------------------------------------------ */

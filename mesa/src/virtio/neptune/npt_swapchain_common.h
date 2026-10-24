@@ -132,6 +132,11 @@ struct npt_guest_swapchain_common {
    mtx_t output_lock;
    IDXGIOutput *fullscreen_target;
    IDXGIOutput *containing_output;
+
+   /* SetPrivateData's entries.  Overlays keep their per-swapchain state
+    * here and look it up on every Present. */
+   mtx_t private_lock;
+   struct npt_gsc_private *private_data;
 };
 
 static inline struct npt_guest_swapchain_common *
