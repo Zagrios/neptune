@@ -18,6 +18,7 @@
 #include "npt_ring.h"
 
 #include "neptune-protocol/npt_protocol_client_id3d11devicecontext.h"
+#include "neptune-protocol/npt_protocol_client_id3duserdefinedannotation.h"
 
 #define NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT4(m, f) \
    NPT_REGISTER_OVERRIDE(id3d11devicecontext4, m, f)
@@ -1341,9 +1342,49 @@ ctx_OMGetRenderTargets_override(void *self, UINT NumViews,
    ctx_confirm_host_view((void **)depth, &NPT_IID_ID3D11DepthStencilView);
 }
 
+/*
+ * Obelisk: ID3DUserDefinedAnnotation answered in the guest.  BeginEvent,
+ * EndEvent and GetStatus return a value, so each was a host round trip
+ * waiting for the ring to drain; Dead by Daylight (UE5) brackets its
+ * passes with them, and its RHI thread spent about a third of its time
+ * there.  They answer as with no profiler attached, as the backends do
+ * (DXMT: -1, -1, FALSE), and the markers, which only a capture tool
+ * reads, no longer cross.
+ */
+static INT NPT_STDMETHODCALLTYPE
+annotation_BeginEvent_override(void *self, const WCHAR *Name)
+{
+   (void)self; (void)Name;
+   return -1;
+}
+
+static INT NPT_STDMETHODCALLTYPE
+annotation_EndEvent_override(void *self)
+{
+   (void)self;
+   return -1;
+}
+
+static void NPT_STDMETHODCALLTYPE
+annotation_SetMarker_override(void *self, const WCHAR *Name)
+{
+   (void)self; (void)Name;
+}
+
+static BOOL NPT_STDMETHODCALLTYPE
+annotation_GetStatus_override(void *self)
+{
+   (void)self;
+   return FALSE;
+}
+
 void
 npt_overrides_d3d11_context_init(void)
 {
+   NPT_REGISTER_OVERRIDE(id3duserdefinedannotation, BeginEvent, annotation_BeginEvent_override);
+   NPT_REGISTER_OVERRIDE(id3duserdefinedannotation, EndEvent, annotation_EndEvent_override);
+   NPT_REGISTER_OVERRIDE(id3duserdefinedannotation, SetMarker, annotation_SetMarker_override);
+   NPT_REGISTER_OVERRIDE(id3duserdefinedannotation, GetStatus, annotation_GetStatus_override);
    NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(Map,   ctx_Map_override);
    NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(Unmap, ctx_Unmap_override);
    NPT_REGISTER_OVERRIDE_D3D11_DEVICE_CONTEXT(CopySubresourceRegion, ctx_CopySubresourceRegion_override);
