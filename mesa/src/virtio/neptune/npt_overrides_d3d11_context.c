@@ -1277,7 +1277,10 @@ ctx_GetData_override(void *self, ID3D11Asynchronous *pAsync, void *pData,
       return NPT_S_OK;
    }
 
-   if (npt_profile_now_ns() - aux->end_ns > NPT_QUERY_LOCAL_WAIT_NS)
+   /* A game spinning on GetData would read the clock (a system call) at
+    * every poll: one in 16 is enough to notice the wait. */
+   if ((++aux->empty_polls & 15) == 0 &&
+       npt_profile_now_ns() - aux->end_ns > NPT_QUERY_LOCAL_WAIT_NS)
       return npt_id3d11devicecontext_default_GetData(self, pAsync, pData,
                                                      DataSize, GetDataFlags);
 

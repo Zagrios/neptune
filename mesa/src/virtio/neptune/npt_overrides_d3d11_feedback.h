@@ -47,6 +47,8 @@ struct npt_d3d11_query_aux {
     * GetData last asked the host to flush for. */
    uint64_t end_ns;
    uint32_t flushed_version;
+   /* GetData calls that found no result, to read the clock on a few. */
+   uint32_t empty_polls;
 };
 
 /* Type-safe downcast from an ID3D11Asynchronous (or any tier in the
