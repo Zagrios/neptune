@@ -23,6 +23,12 @@
  *    pipeline state stream travels subobject by subobject, so one the
  *    encoder cannot walk is refused here with E_INVALIDARG, as D3D12
  *    refuses it.
+ *  - GetCopyableFootprints{,1}: the host replies with every output array,
+ *    whichever the app asked for.  An app may pass NULL for the arrays it
+ *    does not need (an upload allocator asking only for TotalBytes), and
+ *    the reply decoder would leave those arrays in the stream and read
+ *    TotalBytes from the wrong place; the missing outputs get scratch
+ *    space here.
  *  - GetDeviceRemovedReason: DXGI_ERROR_DRIVER_INTERNAL_ERROR once the
  *    render server no longer serves the context (npt_renderer_is_lost).
  *  - The methods that cannot cross the wire are answered here, as a
@@ -315,6 +321,130 @@ dev12_CheckFeatureSupport_override(void *self,
       return hr;
    }
    }
+}
+
+/* ==========================================================================
+ * GetCopyableFootprints: outputs the app left NULL
+ * ========================================================================== */
+
+/* Outputs of one footprint query: the three per-subresource arrays and the
+ * total, with scratch space standing in for those the app did not pass. */
+struct dev12_footprint_outputs {
+   D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts;
+   UINT *rows;
+   UINT64 *row_sizes;
+   UINT64 *total;
+   void *scratch;
+   UINT64 scratch_total;
+};
+
+static bool
+dev12_footprint_outputs_init(struct dev12_footprint_outputs *out,
+                             UINT NumSubresources,
+                             D3D12_PLACED_SUBRESOURCE_FOOTPRINT *pLayouts,
+                             UINT *pNumRows,
+                             UINT64 *pRowSizeInBytes,
+                             UINT64 *pTotalBytes)
+{
+   out->layouts = pLayouts;
+   out->rows = pNumRows;
+   out->row_sizes = pRowSizeInBytes;
+   out->total = pTotalBytes ? pTotalBytes : &out->scratch_total;
+   out->scratch = NULL;
+
+   const size_t n = NumSubresources;
+   const size_t layouts_bytes = pLayouts ? 0 : n * sizeof(*pLayouts);
+   const size_t sizes_bytes = pRowSizeInBytes ? 0 : n * sizeof(*pRowSizeInBytes);
+   const size_t rows_bytes = pNumRows ? 0 : n * sizeof(*pNumRows);
+   if (!layouts_bytes && !sizes_bytes && !rows_bytes)
+      return true;
+
+   /* Widest alignment first, so each array stays naturally aligned. */
+   uint8_t *at = malloc(layouts_bytes + sizes_bytes + rows_bytes);
+   if (!at)
+      return false;
+   out->scratch = at;
+   if (layouts_bytes) {
+      out->layouts = (D3D12_PLACED_SUBRESOURCE_FOOTPRINT *)at;
+      at += layouts_bytes;
+   }
+   if (sizes_bytes) {
+      out->row_sizes = (UINT64 *)at;
+      at += sizes_bytes;
+   }
+   if (rows_bytes)
+      out->rows = (UINT *)at;
+   return true;
+}
+
+/* No room for the outputs the host always sends: the call cannot cross,
+ * so answer as D3D12 does for a description it cannot lay out. */
+static void
+dev12_footprint_outputs_invalid(UINT NumSubresources,
+                                D3D12_PLACED_SUBRESOURCE_FOOTPRINT *pLayouts,
+                                UINT *pNumRows,
+                                UINT64 *pRowSizeInBytes,
+                                UINT64 *pTotalBytes)
+{
+   const size_t n = NumSubresources;
+   if (pLayouts)
+      memset(pLayouts, 0xff, n * sizeof(*pLayouts));
+   if (pNumRows)
+      memset(pNumRows, 0xff, n * sizeof(*pNumRows));
+   if (pRowSizeInBytes)
+      memset(pRowSizeInBytes, 0xff, n * sizeof(*pRowSizeInBytes));
+   if (pTotalBytes)
+      *pTotalBytes = UINT64_MAX;
+}
+
+static void NPT_STDMETHODCALLTYPE
+dev12_GetCopyableFootprints_override(void *self,
+                                     const D3D12_RESOURCE_DESC *pResourceDesc,
+                                     UINT FirstSubresource,
+                                     UINT NumSubresources,
+                                     UINT64 BaseOffset,
+                                     D3D12_PLACED_SUBRESOURCE_FOOTPRINT *pLayouts,
+                                     UINT *pNumRows,
+                                     UINT64 *pRowSizeInBytes,
+                                     UINT64 *pTotalBytes)
+{
+   struct dev12_footprint_outputs out;
+   if (!dev12_footprint_outputs_init(&out, NumSubresources, pLayouts, pNumRows,
+                                     pRowSizeInBytes, pTotalBytes)) {
+      dev12_footprint_outputs_invalid(NumSubresources, pLayouts, pNumRows,
+                                      pRowSizeInBytes, pTotalBytes);
+      return;
+   }
+   npt_call_ID3D12Device_GetCopyableFootprints(
+      npt_com_self_ring(self), npt_com_self_id(self), pResourceDesc,
+      FirstSubresource, NumSubresources, BaseOffset, out.layouts, out.rows,
+      out.row_sizes, out.total);
+   free(out.scratch);
+}
+
+static void NPT_STDMETHODCALLTYPE
+dev12_GetCopyableFootprints1_override(void *self,
+                                      const D3D12_RESOURCE_DESC1 *pResourceDesc,
+                                      UINT FirstSubresource,
+                                      UINT NumSubresources,
+                                      UINT64 BaseOffset,
+                                      D3D12_PLACED_SUBRESOURCE_FOOTPRINT *pLayouts,
+                                      UINT *pNumRows,
+                                      UINT64 *pRowSizeInBytes,
+                                      UINT64 *pTotalBytes)
+{
+   struct dev12_footprint_outputs out;
+   if (!dev12_footprint_outputs_init(&out, NumSubresources, pLayouts, pNumRows,
+                                     pRowSizeInBytes, pTotalBytes)) {
+      dev12_footprint_outputs_invalid(NumSubresources, pLayouts, pNumRows,
+                                      pRowSizeInBytes, pTotalBytes);
+      return;
+   }
+   npt_call_ID3D12Device8_GetCopyableFootprints1(
+      npt_com_self_ring(self), npt_com_self_id(self), pResourceDesc,
+      FirstSubresource, NumSubresources, BaseOffset, out.layouts, out.rows,
+      out.row_sizes, out.total);
+   free(out.scratch);
 }
 
 /* ==========================================================================
@@ -887,6 +1017,10 @@ npt_overrides_d3d12_device_init(void)
 {
    NPT_REGISTER_OVERRIDE_D3D12_DEVICE(CheckFeatureSupport,
                                       dev12_CheckFeatureSupport_override);
+   NPT_REGISTER_OVERRIDE_D3D12_DEVICE(GetCopyableFootprints,
+                                      dev12_GetCopyableFootprints_override);
+   NPT_REGISTER_OVERRIDE_D3D12_DEVICE8(GetCopyableFootprints1,
+                                       dev12_GetCopyableFootprints1_override);
    NPT_REGISTER_OVERRIDE_D3D12_DEVICE(CreateCommandQueue,
                                       dev12_CreateCommandQueue_override);
    NPT_REGISTER_OVERRIDE_D3D12_DEVICE(GetDeviceRemovedReason,
