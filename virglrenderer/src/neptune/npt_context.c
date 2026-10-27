@@ -439,6 +439,7 @@ npt_context_release_object(struct npt_context *ctx, uint64_t guest_id)
    if (!obj)
       return;
 
+   npt_feedback_forget_orphan_signals(ctx, obj);
    npt_com_release(obj);
 
    /* Only after the host library dropped the heap, and with it the

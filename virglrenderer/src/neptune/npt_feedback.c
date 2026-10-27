@@ -93,6 +93,76 @@ fb_find_by_host_obj_locked(struct npt_feedback_state *st, void *host_obj)
    return he ? he->data : NULL;
 }
 
+/* The orphan slot of host_fence, or NULL.  A fence holds at most one. */
+static struct npt_feedback_orphan_signal *
+fb_find_orphan_locked(struct npt_feedback_state *st, void *host_fence)
+{
+   if (!st->orphan_count)
+      return NULL;
+   for (uint32_t i = 0; i < ARRAY_SIZE(st->orphans); i++) {
+      if (st->orphans[i].host_fence == host_fence)
+         return &st->orphans[i];
+   }
+   return NULL;
+}
+
+static void
+fb_drop_orphan_locked(struct npt_feedback_state *st,
+                      struct npt_feedback_orphan_signal *o)
+{
+   memset(o, 0, sizeof(*o));
+   st->orphan_count--;
+}
+
+/* A Signal for a fence with no entry yet: remember its highest value and its latest one.  With every slot
+ * taken, the oldest is overwritten. */
+static void
+fb_note_orphan_signal_locked(struct npt_feedback_state *st, void *host_fence,
+                             uint64_t value)
+{
+   struct npt_feedback_orphan_signal *o = fb_find_orphan_locked(st, host_fence);
+   if (o) {
+      if (value > o->high)
+         o->high = value;
+      o->last = value;
+      return;
+   }
+   o = &st->orphans[st->orphan_next];
+   st->orphan_next = (st->orphan_next + 1) % ARRAY_SIZE(st->orphans);
+   if (!o->host_fence)
+      st->orphan_count++;
+   *o = (struct npt_feedback_orphan_signal){ host_fence, value, value };
+}
+
+/* The orphan Signals of host_fence, forgotten once taken. */
+static bool
+fb_take_orphan_signal_locked(struct npt_feedback_state *st, void *host_fence,
+                             uint64_t *high, uint64_t *last)
+{
+   struct npt_feedback_orphan_signal *o = fb_find_orphan_locked(st, host_fence);
+   if (!o)
+      return false;
+   *high = o->high;
+   *last = o->last;
+   fb_drop_orphan_locked(st, o);
+   return true;
+}
+
+void
+npt_feedback_forget_orphan_signals(struct npt_context *ctx, void *host_obj)
+{
+   struct npt_feedback_state *st = &ctx->feedback;
+   if (!host_obj || !st->table ||
+       !atomic_load_explicit((_Atomic uint32_t *)&st->orphan_count,
+                             memory_order_relaxed))
+      return;
+   mtx_lock(&st->mutex);
+   struct npt_feedback_orphan_signal *o = fb_find_orphan_locked(st, host_obj);
+   if (o)
+      fb_drop_orphan_locked(st, o);
+   mtx_unlock(&st->mutex);
+}
+
 void
 npt_feedback_fini(struct npt_context *ctx)
 {
@@ -203,6 +273,7 @@ npt_feedback_register_locked(struct npt_context *ctx,
       entry->version = 0;
       entry->target_value = 0;
       entry->published_high = 0;
+      entry->last_signal = 0;
       entry->persistent = false;
       entry->rewound = false;
       /* Keep mutex held: caller sets type-specific fields then calls
@@ -511,10 +582,27 @@ npt_feedback_fence_register(struct npt_context *ctx,
    if (!entry)
       return;
    /* Persistent: the entry stays for the fence's lifetime; each
-    * Signal-driven poll updates the slot in place.  host_obj is
-    * resolved lazily on first Signal. */
+    * Signal-driven poll updates the slot in place. */
    entry->persistent = true;
+
+   /* Resolve the host fence now, so its Signals find the entry by host
+    * pointer.  One may already have come through a queue's ring (see
+    * npt_feedback_state.orphans): arm the entry with it, or the guest keeps
+    * reading the seeded value. */
+   void *host_fence = npt_context_lookup_object(ctx, NULL, fence_id,
+                                                NPT_OBJECT_TYPE_IUNKNOWN);
+   fb_bind_host_obj_locked(&ctx->feedback, entry, host_fence);
+   uint64_t high, last;
+   const bool armed = host_fence &&
+      fb_take_orphan_signal_locked(&ctx->feedback, host_fence, &high, &last);
+   if (armed) {
+      entry->target_value = high;
+      entry->last_signal = last;
+      npt_feedback_set_pending_locked(ctx, entry);
+   }
    npt_feedback_state_unlock(ctx);
+   if (armed)
+      npt_context_notify_rings_feedback(ctx);
 }
 
 void
@@ -525,18 +613,17 @@ npt_feedback_fence_mark_signal(struct npt_context *ctx, void *host_fence,
       return;
 
    npt_feedback_state_lock(ctx);
-   /* Fast path: entry's host_obj already resolved (every Signal
-    * after the first hits this).  Both fence types share one host
-    * pointer namespace, so scan for either. */
+   /* Fast path: entry's host_obj already resolved (REGISTER resolves
+    * it).  Both fence types share one host pointer namespace, so scan
+    * for either. */
    struct npt_feedback_entry *entry =
       fb_find_by_host_obj_locked(&ctx->feedback, host_fence);
    if (entry && !npt_feedback_type_is_fence(entry->type))
       entry = NULL;
    if (!entry) {
-      /* First-time resolve: fence registered before any Signal hasn't
-       * had host_obj cached.  Walk fence entries with NULL host_obj
-       * and bind via the object table.  Linear scan; fence counts are
-       * small. */
+      /* An entry whose REGISTER could not resolve its host fence:
+       * walk fence entries with NULL host_obj and bind via the object
+       * table.  Linear scan; fence counts are small. */
       hash_table_foreach(ctx->feedback.table, e) {
          struct npt_feedback_entry *cand = e->data;
          if (!npt_feedback_type_is_fence(cand->type) || cand->host_obj)
@@ -549,6 +636,11 @@ npt_feedback_fence_mark_signal(struct npt_context *ctx, void *host_fence,
          }
       }
    }
+   /* No entry yet: the fence's REGISTER is still on the device ring. */
+   if (!entry)
+      fb_note_orphan_signal_locked(&ctx->feedback, host_fence, value);
+   else
+      entry->last_signal = value;
    /* A fence the host has seen rewind owes no further polls: the guest
     * reads such a fence over the wire rather than from the slot. */
    const bool armed = entry && !entry->rewound;
@@ -586,9 +678,9 @@ static bool
 npt_feedback_fence_poll_one(struct npt_context *ctx,
                             struct npt_feedback_entry *entry)
 {
-   /* Entries reach pending only via the Signal hook, which always
-    * resolves host_obj first.  An unresolved entry here would be a
-    * Signal-hook bug; defensively skip. */
+   /* Entries reach pending only via the Signal hook or a REGISTER that
+    * picked up an orphan Signal, which both resolve host_obj first.  An
+    * unresolved entry here would be a bug there; defensively skip. */
    if (!entry->host_obj || !entry->fb_res_id)
       return false;
 

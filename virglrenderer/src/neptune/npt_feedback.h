@@ -67,6 +67,10 @@ enum npt_feedback_type {
  *               rather than "a fence exists"; the next Signal re-arms it.
  *   published_high Fences only: highest value ever written to the slot,
  *               used to notice a rewind -- see `rewound`.
+ *   last_signal Fences only: value of the latest Signal that reached the
+ *               host.  After a rewind target_value still holds the old
+ *               high, so a queue Wait asks this one whether its Signal
+ *               has come.
  *   rewound     Fences only, sticky: the host observed the fence go
  *               backwards, which D3D12 permits.  Such an entry stops
  *               owing polls, and the guest reads that fence over the
@@ -91,6 +95,7 @@ struct npt_feedback_entry {
 
    uint64_t target_value;
    uint64_t published_high;
+   uint64_t last_signal;
 
    bool persistent;
    bool pending;
@@ -110,6 +115,21 @@ struct npt_feedback_state {
 
    struct list_head pending;
    uint32_t pending_count;
+
+   /* Fence Signals that reached the host before their fence's REGISTER.
+    * A queue's Signal and the device's REGISTER travel on different rings,
+    * so the Signal can win; a fence signalled once would then never be
+    * published and the guest would read its seeded value forever.  Kept
+    * for the REGISTER to pick up, and dropped when the fence is released,
+    * so that a fence created later at the same address does not inherit
+    * them.  orphan_count: slots in use, the release's fast path. */
+   struct npt_feedback_orphan_signal {
+      void *host_fence;
+      uint64_t high;   /* becomes the entry's target_value */
+      uint64_t last;   /* becomes the entry's last_signal */
+   } orphans[256];
+   uint32_t orphan_next;
+   uint32_t orphan_count;
 
    /* Last poll wall-clock; drives the rate-limit. */
    uint64_t last_poll_ns;
@@ -235,13 +255,20 @@ void npt_feedback_fence_register(struct npt_context *ctx,
 
 /* Called from the Signal dispatch overrides after the host call
  * succeeds; host_fence is already resolved by the dispatcher.  Matches entries of either fence type.  `value` is the
- * value being signalled: it raises the entry's target_value, and the
- * poller drops the entry from pending once GetCompletedValue reaches
- * it.  Wakes the context's ring threads so an entry armed off the ring
- * thread can never be left unpolled.  No-op on miss, and on a fence the
- * poller has latched as rewound. */
+ * value being signalled: it becomes the entry's last_signal and raises its
+ * target_value, and the poller drops the entry from pending once
+ * GetCompletedValue reaches it.  Wakes the context's ring threads so an
+ * entry armed off the ring thread can never be left unpolled.  On a miss
+ * the Signal is kept as an orphan for the fence's REGISTER; a fence the
+ * poller has latched as rewound only gets its last_signal. */
 void npt_feedback_fence_mark_signal(struct npt_context *ctx,
                                     void *host_fence,
                                     uint64_t value);
+
+/* Drops the orphan Signals of host_obj.  Called before the host object is
+ * released: a fence created at the same address afterwards must not
+ * inherit them. */
+void npt_feedback_forget_orphan_signals(struct npt_context *ctx,
+                                        void *host_obj);
 
 #endif /* NPT_FEEDBACK_H */
