@@ -7,6 +7,7 @@
  */
 
 #include "npt_queue.h"
+#include "npt_feedback.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -288,6 +289,14 @@ retire:;
                                   sync->sync_fd, wait_us, rc);
       }
 
+      /* The retirement wakes the guest's waiter, which signals the app's
+       * event, and the app then reads the fence from its feedback slot:
+       * publish the slots first.  The ring threads publish them at most
+       * every NPT_FEEDBACK_POLL_INTERVAL_NS, and a reader that came back
+       * sooner saw the old value and waited again with nothing armed (THE
+       * FINALS' RHI interrupt thread: a 5 s stall at every few frames
+       * once the game had the focus). */
+      npt_feedback_poll_interval(queue->context, 0);
       list_del(&sync->head);
       npt_queue_sync_retire(queue, sync);
    }
