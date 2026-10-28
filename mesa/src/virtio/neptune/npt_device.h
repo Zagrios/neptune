@@ -71,6 +71,13 @@ struct npt_device {
    mtx_t instance_rings_mutex;
    struct list_head instance_rings;
 
+   /* COM_RELEASEs waiting for the peer rings to dispatch what they held
+    * when the app released the object (npt_ring_send_com_release),
+    * oldest first. */
+   mtx_t pending_releases_mutex;
+   struct list_head pending_releases;
+   _Atomic uint32_t pending_release_count; /* read unlocked for a quick no */
+
    /* Shared ring for DC + SC: DXGI requires Present on the immediate-
     * context thread and the host D3D library has no internal locking
     * to coordinate DC vs SC vs Device, so DC and SC must share one

@@ -493,19 +493,113 @@ npt_ring_drain_peer_rings_unlocked(struct npt_ring *primary)
    npt_ring_lock_acquire(&primary->lock);
 }
 
-void
-npt_ring_send_com_release(struct npt_device *dev, uint64_t host_id)
+/*
+ * A COM_RELEASE held back until the peer rings dispatch past the tails
+ * they had when the app released the object.  The release used to wait
+ * for them, under the primary ring: a ring busy with a pipeline
+ * compilation holds its current command for up to a second, so every
+ * release of every thread waited that long (THE FINALS rendered one
+ * frame a second while its PSO precompile threads ran).
+ */
+struct npt_pending_release {
+   struct list_head head;
+   uint64_t host_id;
+   uint32_t count;
+   struct npt_release_peer {
+      uint64_t ring_id;
+      uint32_t seqno;
+   } peers[];
+};
+
+/* Rings a release can wait for, and releases held back, before the
+ * release waits the old way. */
+#define NPT_RELEASE_PEERS_MAX 256
+#define NPT_PENDING_RELEASES_MAX 16384
+
+struct npt_peer_state {
+   uint64_t ring_id;
+   uint32_t head;
+   uint32_t cur;
+   uint32_t buffer_size;
+   uint32_t tail;
+};
+
+struct npt_peer_states {
+   struct npt_peer_state *out;
+   int n, max;
+   bool overflow;
+};
+
+static void
+npt_peer_states_add(struct npt_peer_states *ps, struct npt_ring *r)
 {
-   if (!dev || !dev->ring || !host_id)
+   if (ps->n == ps->max) {
+      ps->overflow = true;
       return;
+   }
+   struct npt_peer_state *st = &ps->out[ps->n++];
+   st->ring_id = r->id;
+   st->tail = atomic_load_explicit(r->tail, memory_order_acquire);
+   st->cur = npt_ring_seqno_now(r);
+   st->head = npt_ring_load_head(r);
+   st->buffer_size = r->buffer_size;
+}
 
-   /* Drain peer rings before the release crosses the wire so an
-    * in-flight async use of host_id on a TLS / instance ring is
-    * fully observed by the host before the release. */
-   struct npt_ring *primary = dev->ring;
-   npt_ring_lock_acquire(&primary->lock);
-   npt_ring_drain_peer_rings_unlocked(primary);
+/* The peer rings of primary (TLS rings, instance rings) as they are
+ * now.  The list mutexes keep each ring alive while it is read.
+ * Returns the count, or -1 when there are more than max. */
+static int
+npt_ring_peer_states(struct npt_device *dev, struct npt_ring *primary,
+                     struct npt_peer_state *out, int max)
+{
+   struct npt_peer_states ps = { out, 0, max, false };
+   mtx_lock(&dev->tls_rings_mutex);
+   list_for_each_entry(struct npt_tls_ring, tr, &dev->tls_rings, dev_head) {
+      mtx_lock(&tr->mutex);
+      struct npt_ring *r =
+         atomic_load_explicit(&tr->ring, memory_order_acquire);
+      if (r && r != primary)
+         npt_peer_states_add(&ps, r);
+      mtx_unlock(&tr->mutex);
+   }
+   mtx_unlock(&dev->tls_rings_mutex);
+   mtx_lock(&dev->instance_rings_mutex);
+   list_for_each_entry(struct npt_ring, ir, &dev->instance_rings,
+                       instance_head) {
+      if (ir != primary)
+         npt_peer_states_add(&ps, ir);
+   }
+   mtx_unlock(&dev->instance_rings_mutex);
+   return ps.overflow ? -1 : ps.n;
+}
 
+/* npt_ring_seqno_status on a state read by npt_ring_peer_states. */
+static bool
+npt_peer_state_reached(const struct npt_peer_state *st, uint32_t seqno)
+{
+   if ((uint32_t)(st->cur - seqno) >= st->buffer_size)
+      return true;
+   return (int32_t)(st->head - seqno) >= 0;
+}
+
+/* Whether peer's ring has dispatched past its seqno.  A ring that is
+ * gone was destroyed, and DESTROY_RING is host-synchronous: its bytes
+ * were consumed already. */
+static bool
+npt_peer_reached(const struct npt_peer_state *states, int n,
+                 const struct npt_release_peer *peer)
+{
+   for (int i = 0; i < n; i++) {
+      if (states[i].ring_id == peer->ring_id)
+         return npt_peer_state_reached(&states[i], peer->seqno);
+   }
+   return true;
+}
+
+static void
+npt_ring_submit_com_release_locked(struct npt_ring *primary,
+                                   uint64_t host_id)
+{
    struct npt_cmd_com_release cmd;
    memset(&cmd, 0, sizeof(cmd));
    cmd.header.cmd_type =
@@ -514,6 +608,113 @@ npt_ring_send_com_release(struct npt_device *dev, uint64_t host_id)
    cmd.header.cmd_size = sizeof(cmd);
    cmd.header.object_id = host_id;
    npt_ring_submit_dispatch_locked(primary, &cmd, sizeof(cmd));
+}
+
+/* Caller holds pending_releases_mutex.  states is a snapshot of the peer
+ * rings (npt_ring_peer_states, n of them, -1 when too many), any older
+ * one only holds releases back longer; NULL to take one. */
+static void
+npt_ring_flush_pending_releases_locked(struct npt_device *dev, bool wait,
+                                       const struct npt_peer_state *states,
+                                       int n)
+{
+   if (list_is_empty(&dev->pending_releases))
+      return;
+   struct npt_ring *primary = dev->ring;
+   struct npt_peer_state own[NPT_RELEASE_PEERS_MAX];
+   if (!wait && !states) {
+      n = npt_ring_peer_states(dev, primary, own, NPT_RELEASE_PEERS_MAX);
+      states = own;
+   }
+   if (n < 0)
+      wait = true;
+   bool locked = false;
+   list_for_each_entry_safe(struct npt_pending_release, pr,
+                            &dev->pending_releases, head) {
+      for (uint32_t i = 0; i < pr->count; i++) {
+         if (wait) {
+            npt_tls_wait_ring_seqno(dev, pr->peers[i].ring_id,
+                                    pr->peers[i].seqno);
+         } else if (!npt_peer_reached(states, n, &pr->peers[i])) {
+            /* Oldest first: the ones after it can wait for the next
+             * flush. */
+            goto out;
+         }
+      }
+      if (!locked) {
+         npt_ring_lock_acquire(&primary->lock);
+         locked = true;
+      }
+      npt_ring_submit_com_release_locked(primary, pr->host_id);
+      list_del(&pr->head);
+      atomic_fetch_sub_explicit(&dev->pending_release_count, 1,
+                                memory_order_relaxed);
+      free(pr);
+   }
+out:
+   if (locked)
+      npt_ring_unlock_and_notify(primary);
+}
+
+void
+npt_ring_flush_pending_releases(struct npt_device *dev, bool wait)
+{
+   /* Unlocked: a release queued meanwhile waits for the next flush. */
+   if (!dev || !dev->ring ||
+       !atomic_load_explicit(&dev->pending_release_count,
+                             memory_order_relaxed))
+      return;
+   mtx_lock(&dev->pending_releases_mutex);
+   npt_ring_flush_pending_releases_locked(dev, wait, NULL, 0);
+   mtx_unlock(&dev->pending_releases_mutex);
+}
+
+void
+npt_ring_send_com_release(struct npt_device *dev, uint64_t host_id)
+{
+   if (!dev || !dev->ring || !host_id)
+      return;
+
+   struct npt_ring *primary = dev->ring;
+   struct npt_peer_state states[NPT_RELEASE_PEERS_MAX];
+   const int n = npt_ring_peer_states(dev, primary, states,
+                                      NPT_RELEASE_PEERS_MAX);
+   struct npt_release_peer peers[NPT_RELEASE_PEERS_MAX];
+   uint32_t count = 0;
+   for (int i = 0; i < n; i++) {
+      if (!npt_peer_state_reached(&states[i], states[i].tail))
+         peers[count++] = (struct npt_release_peer){ states[i].ring_id,
+                                                     states[i].tail };
+   }
+
+   struct npt_pending_release *pr = NULL;
+   if (n >= 0 && count) {
+      pr = malloc(sizeof(*pr) + count * sizeof(pr->peers[0]));
+      if (pr) {
+         pr->host_id = host_id;
+         pr->count = count;
+         memcpy(pr->peers, peers, count * sizeof(peers[0]));
+      }
+   }
+
+   mtx_lock(&dev->pending_releases_mutex);
+   if (pr) {
+      list_addtail(&pr->head, &dev->pending_releases);
+      const uint32_t pending =
+         atomic_fetch_add_explicit(&dev->pending_release_count, 1,
+                                   memory_order_relaxed) + 1;
+      npt_ring_flush_pending_releases_locked(
+         dev, pending > NPT_PENDING_RELEASES_MAX, states, n);
+      mtx_unlock(&dev->pending_releases_mutex);
+      return;
+   }
+   npt_ring_flush_pending_releases_locked(dev, false, states, n);
+   mtx_unlock(&dev->pending_releases_mutex);
+
+   npt_ring_lock_acquire(&primary->lock);
+   if (n < 0 || count)
+      npt_ring_drain_peer_rings_unlocked(primary); /* too many rings, or no memory */
+   npt_ring_submit_com_release_locked(primary, host_id);
    npt_ring_unlock_and_notify(primary);
 }
 

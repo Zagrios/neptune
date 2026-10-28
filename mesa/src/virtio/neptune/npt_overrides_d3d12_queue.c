@@ -46,6 +46,7 @@ queue12_ExecuteCommandLists_override(void *self, UINT NumCommandLists,
    struct npt_ring *queue_ring = npt_com_self_ring(self);
 
    npt_d3d12_sync_maps_flush(queue_ring);
+   npt_ring_flush_pending_releases(dev, false);
 
    if (dev->multi_ring_enabled) {
       /* Peek, don't create: a thread that only ever submits has nothing

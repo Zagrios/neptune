@@ -305,13 +305,20 @@ npt_ring_seqno_now(const struct npt_ring *ring)
 
 /*
  * Queue a COM_RELEASE on the device's primary ring.  Routing every
- * release through primary lets the cross-ring drain barrier (waits
- * for TLS / instance rings to dispatch past their tail) cover releases
- * from any ring with a single barrier — closes the UAF window where
- * a release here could race a pending async use of host_id on
- * another thread's ring.
+ * release through primary orders it after this thread's earlier uses;
+ * a release is sent only once every TLS / instance ring has dispatched
+ * past the tail it had at release time -- closes the UAF window where
+ * a release here could race a pending async use of host_id on another
+ * thread's ring.  The caller does not wait for those rings: a release
+ * they still hold back is sent by a later release, ExecuteCommandLists
+ * or device teardown (npt_ring_flush_pending_releases).
  */
 void
 npt_ring_send_com_release(struct npt_device *dev, uint64_t host_id);
+
+/* Send the held-back releases whose rings have caught up, oldest first;
+ * with wait, wait for the rings and send them all. */
+void
+npt_ring_flush_pending_releases(struct npt_device *dev, bool wait);
 
 #endif /* NPT_RING_H */

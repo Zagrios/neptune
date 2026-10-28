@@ -316,6 +316,8 @@ npt_device_create(void)
 
    mtx_init(&dev->instance_rings_mutex, mtx_plain);
    list_inithead(&dev->instance_rings);
+   mtx_init(&dev->pending_releases_mutex, mtx_plain);
+   list_inithead(&dev->pending_releases);
    atomic_store_explicit(&dev->dc_sc_ring, (struct npt_ring *)NULL,
                          memory_order_relaxed);
    atomic_store_explicit(&dev->dc_sc_ring_refs, 0, memory_order_relaxed);
@@ -333,6 +335,7 @@ npt_device_create(void)
    dev->ring = npt_ring_create(dev, &layout, ring_id, false /* primary */);
    if (!dev->ring) {
       npt_log("failed to create ring");
+      mtx_destroy(&dev->pending_releases_mutex);
       mtx_destroy(&dev->instance_rings_mutex);
       mtx_destroy(&dev->tls_rings_mutex);
       npt_wrapper_cache_fini(&dev->wrapper_cache);
@@ -436,6 +439,7 @@ npt_device_destroy(struct npt_device *dev)
     * -> stop event waiter -> data pool -> ring -> cache -> renderer. */
    npt_device_wrapper_cache_foreach(dev, npt_device_destroy_drain_wrapper,
                                     dev);
+   npt_ring_flush_pending_releases(dev, true);
    npt_event_fini(dev);
    npt_shmem_pool_fini(dev->renderer, &dev->data_pool);
    npt_shmem_pool_fini(dev->renderer, &dev->map_pool);
@@ -460,6 +464,7 @@ npt_device_destroy(struct npt_device *dev)
    mtx_unlock(&dev->tls_rings_mutex);
 
    npt_ring_destroy(dev->ring);
+   mtx_destroy(&dev->pending_releases_mutex);
    mtx_destroy(&dev->instance_rings_mutex);
    mtx_destroy(&dev->tls_rings_mutex);
    npt_wrapper_cache_fini(&dev->wrapper_cache);
