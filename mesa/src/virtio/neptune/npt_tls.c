@@ -99,15 +99,16 @@ npt_tls_get(void)
    return tls;
 }
 
-/* This thread's TLS ring for dev, or NULL if it has none yet. */
+/* This thread's TLS ring (or side ring) for dev, or NULL if it has none
+ * yet. */
 static struct npt_ring *
-npt_tls_find_ring(struct npt_tls *tls, struct npt_device *dev)
+npt_tls_find_ring(struct npt_tls *tls, struct npt_device *dev, bool side)
 {
    list_for_each_entry(struct npt_tls_ring, tr, &tls->tls_rings,
                        tls_head) {
       struct npt_ring *ring =
          atomic_load_explicit(&tr->ring, memory_order_acquire);
-      if (tr->device == dev && ring)
+      if (tr->device == dev && tr->side == side && ring)
          return ring;
    }
    return NULL;
@@ -119,7 +120,65 @@ npt_tls_peek_ring(struct npt_device *dev)
    if (!dev || !dev->multi_ring_enabled)
       return NULL;
    struct npt_tls *tls = npt_tls_get();
-   return tls ? npt_tls_find_ring(tls, dev) : NULL;
+   return tls ? npt_tls_find_ring(tls, dev, false) : NULL;
+}
+
+/* A new TLS ring of dev, on the device's list (device teardown destroys
+ * it).  Primary is drained first so the work this thread queued there
+ * commits before its first submission on the new ring. */
+static struct npt_tls_ring *
+npt_tls_new_ring(struct npt_device *dev)
+{
+   npt_ring_wait_all(dev->ring);
+
+   struct npt_tls_ring *tr = calloc(1, sizeof(*tr));
+   if (!tr)
+      return NULL;
+
+   mtx_init(&tr->mutex, mtx_plain);
+   tr->device = dev;
+   list_inithead(&tr->tls_head);
+
+   struct npt_ring_layout layout;
+   npt_ring_get_layout(npt_tls_ring_buffer_size(), NPT_TLS_RING_EXTRA_SIZE,
+                       &layout);
+   const uint64_t ring_id = atomic_fetch_add(&dev->next_ring_id, 1);
+
+   struct npt_ring *new_ring =
+      npt_ring_create(dev, &layout, ring_id, true /* is_tls_ring */);
+   if (!new_ring) {
+      mtx_destroy(&tr->mutex);
+      free(tr);
+      return NULL;
+   }
+   /* Release-store so a peer's acquire-load sees a fully-init ring. */
+   atomic_store_explicit(&tr->ring, new_ring, memory_order_release);
+
+   mtx_lock(&dev->tls_rings_mutex);
+   list_addtail(&tr->dev_head, &dev->tls_rings);
+   mtx_unlock(&dev->tls_rings_mutex);
+   return tr;
+}
+
+/* This thread's TLS ring (or side ring) for dev, created on first use;
+ * NULL when it cannot be. */
+static struct npt_ring *
+npt_tls_ring_of(struct npt_device *dev, bool side)
+{
+   struct npt_tls *tls = npt_tls_get();
+   if (unlikely(!tls))
+      return NULL;
+
+   struct npt_ring *found = npt_tls_find_ring(tls, dev, side);
+   if (found)
+      return found;
+
+   struct npt_tls_ring *tr = npt_tls_new_ring(dev);
+   if (!tr)
+      return NULL;
+   tr->side = side;
+   list_addtail(&tr->tls_head, &tls->tls_rings);
+   return atomic_load_explicit(&tr->ring, memory_order_relaxed);
 }
 
 struct npt_ring *
@@ -133,47 +192,16 @@ npt_tls_get_ring(struct npt_device *dev)
    if (!dev->multi_ring_enabled)
       return dev->ring;
 
-   struct npt_tls *tls = npt_tls_get();
-   if (unlikely(!tls))
-      return dev->ring;
+   struct npt_ring *ring = npt_tls_ring_of(dev, false);
+   return ring ? ring : dev->ring;
+}
 
-   struct npt_ring *found = npt_tls_find_ring(tls, dev);
-   if (found)
-      return found;
-
-   /* Cache miss: drain primary so prior primary work commits before
-    * this thread's first TLS submission. */
-   npt_ring_wait_all(dev->ring);
-
-   struct npt_tls_ring *tr = calloc(1, sizeof(*tr));
-   if (!tr)
-      return dev->ring;
-
-   mtx_init(&tr->mutex, mtx_plain);
-   tr->device = dev;
-
-   struct npt_ring_layout layout;
-   npt_ring_get_layout(npt_tls_ring_buffer_size(), NPT_TLS_RING_EXTRA_SIZE,
-                       &layout);
-   const uint64_t ring_id = atomic_fetch_add(&dev->next_ring_id, 1);
-
-   struct npt_ring *new_ring =
-      npt_ring_create(dev, &layout, ring_id, true /* is_tls_ring */);
-   if (!new_ring) {
-      mtx_destroy(&tr->mutex);
-      free(tr);
-      return dev->ring;
-   }
-   /* Release-store so a peer's acquire-load sees a fully-init ring. */
-   atomic_store_explicit(&tr->ring, new_ring, memory_order_release);
-
-   mtx_lock(&dev->tls_rings_mutex);
-   list_addtail(&tr->dev_head, &dev->tls_rings);
-   mtx_unlock(&dev->tls_rings_mutex);
-
-   list_addtail(&tr->tls_head, &tls->tls_rings);
-
-   return new_ring;
+struct npt_ring *
+npt_tls_side_ring(struct npt_device *dev)
+{
+   if (!dev || !dev->multi_ring_enabled)
+      return NULL;
+   return npt_tls_ring_of(dev, true);
 }
 
 void

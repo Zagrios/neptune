@@ -56,6 +56,7 @@
 #include "npt_device.h"
 #include "npt_env.h"
 #include "npt_overrides.h"
+#include "npt_tls.h"
 
 #include "neptune-protocol/npt_protocol_client_id3d12descriptorheap.h"
 #include "neptune-protocol/npt_protocol_client_id3d12device.h"
@@ -813,8 +814,29 @@ dev12_CreatePipelineState_override(void *self,
          *ppPipelineState = NULL;
       return NPT_E_INVALIDARG;
    }
-   return npt_id3d12device2_default_CreatePipelineState(self, pDesc, riid,
-                                                        ppPipelineState);
+   /* A compilation holds its ring on the host for up to a second: on the
+    * ring the thread's other calls share (primary for D3D12), the render
+    * thread's calls waited behind every pipeline the engine precompiled
+    * (THE FINALS: about a frame a second while it preloaded shaders).
+    * The call is synchronous under multi-ring, so the pipeline exists on
+    * the host before any other ring can use it. */
+   struct npt_device *dev = npt_com_self_device(self);
+   struct npt_ring *ring = npt_tls_side_ring(dev);
+   if (!ring)
+      return npt_id3d12device2_default_CreatePipelineState(self, pDesc, riid,
+                                                           ppPipelineState);
+   void *raw = NULL;
+   const HRESULT hr = npt_call_ID3D12Device2_CreatePipelineState(
+      ring, npt_com_self_id(self), pDesc, riid,
+      ppPipelineState ? &raw : NULL);
+   if (ppPipelineState) {
+      *ppPipelineState =
+         NPT_SUCCEEDED(hr) && raw
+            ? (void *)npt_com_get_or_wrap(dev, riid, (uint64_t)(uintptr_t)raw,
+                                          (struct npt_com_base *)self)
+            : NULL;
+   }
+   return hr;
 }
 
 static HRESULT NPT_STDMETHODCALLTYPE

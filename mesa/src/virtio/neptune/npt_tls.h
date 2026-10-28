@@ -29,6 +29,7 @@ struct npt_tls_ring {
    mtx_t mutex;
    _Atomic(struct npt_ring *) ring;
    struct npt_device *device;
+   bool side; /* npt_tls_side_ring */
    struct list_head tls_head;
    struct list_head dev_head;
 };
@@ -41,6 +42,13 @@ npt_tls_once_init(void);
  * or when multi-ring is disabled. */
 struct npt_ring *
 npt_tls_get_ring(struct npt_device *dev);
+
+/* A ring of the calling thread for calls that take long on the host
+ * (pipeline compilation), whatever ring its other calls take, so they do
+ * not hold back the threads that share that ring.  NULL when the device
+ * is not multi-ring or the ring cannot be created. */
+struct npt_ring *
+npt_tls_side_ring(struct npt_device *dev);
 
 /* The calling thread's existing TLS ring for dev, or NULL when it has
  * none (never creates one; NULL when multi-ring is off).  For barriers
