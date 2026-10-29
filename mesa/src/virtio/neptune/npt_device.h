@@ -20,8 +20,14 @@
  * Wrapper cache: host_id -> guest wrapper, so a host pointer returned
  * twice (e.g. from GetParent) maps to the same wrapper.  Holds a weak
  * reference; the wrapper removes itself in Release.
+ *
+ * Unreal Engine games keep tens of thousands of live D3D11 objects: with
+ * 1024 buckets every npt_com_get_or_wrap walked long chains (THE FINALS:
+ * frame time grew from 8.3 to 10.4 ms over 3 minutes in its menu).
+ * d3d11.dll, dxgi.dll and d3d12.dll share this struct: build them
+ * together.
  */
-#define NPT_WRAPPER_CACHE_BUCKETS 1024
+#define NPT_WRAPPER_CACHE_BUCKETS 65536
 
 struct npt_wrapper_cache_entry {
    uint64_t host_id;
