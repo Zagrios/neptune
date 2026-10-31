@@ -67,6 +67,25 @@ npt_override_CreateDXGIFactory2(UNUSED struct npt_dispatch_context *dctx,
 /* D3D11 device creation                                                */
 /* ================================================================== */
 
+/* ID3D11Multithread follows IUnknown's three slots with Enter, Leave, SetMultithreadProtected, GetMultithreadProtected. */
+#define NPT_ID3D11MULTITHREAD_VTBL_SET_PROTECTED 5
+typedef int32_t (NPT_STDMETHODCALLTYPE *PFN_ID3D11Multithread_SetMultithreadProtected)(void *self, int32_t protect);
+
+/* The host D3D11 library takes no lock on its immediate context unless asked to: on Windows a game with several
+ * threads on the context orders them itself. Here each guest thread's calls run on a ring thread of their own, so
+ * two threads that take turns under the game's lock still overlap on the host, and the context's state (its
+ * encoder, its command chunk) is changed by both at once. Ask the library to lock. */
+static void
+npt_protect_d3d11_device(void *device)
+{
+   void *multithread = NULL;
+   if (npt_com_query_interface(device, &NPT_IID_ID3D11Multithread, &multithread) < 0 || !multithread)
+      return;
+   NPT_COM_VTBL_FUNC(PFN_ID3D11Multithread_SetMultithreadProtected, npt_com_vtable(multithread),
+                     NPT_ID3D11MULTITHREAD_VTBL_SET_PROTECTED)(multithread, 1);
+   npt_com_release(multithread);
+}
+
 static HRESULT
 npt_override_D3D11CreateDevice(UNUSED struct npt_dispatch_context *dctx,
                                struct npt_command_D3D11CreateDevice *args)
@@ -90,6 +109,8 @@ npt_override_D3D11CreateDevice(UNUSED struct npt_dispatch_context *dctx,
       args->ppDevice,
       args->pFeatureLevel,
       args->ppImmediateContext);
+   if (args->ret >= 0 && args->ppDevice && *args->ppDevice)
+      npt_protect_d3d11_device(*args->ppDevice);
    return args->ret;
 }
 
