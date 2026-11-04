@@ -52,6 +52,7 @@
 #endif
 
 #include "vtest.h"
+#include "vtest_cgl.h"
 #include "vtest_shm.h"
 #include "vtest_protocol.h"
 #include "threadpool.h"
@@ -627,6 +628,14 @@ int vtest_init_renderer(bool multi_clients,
 
    ctx_flags |= VIRGL_RENDERER_THREAD_SYNC |
                 VIRGL_RENDERER_USE_EXTERNAL_BLOB;
+#ifdef __APPLE__
+   /* No winsys flag and virgl wanted: the caller's GL contexts, CGL's (--use-cgl). */
+   if (!(ctx_flags & (VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLX | VIRGL_RENDERER_NO_VIRGL))) {
+      renderer_cbs.create_gl_context = vtest_cgl_create_context;
+      renderer_cbs.destroy_gl_context = vtest_cgl_destroy_context;
+      renderer_cbs.make_current = vtest_cgl_make_current;
+   }
+#endif
    ret = virgl_renderer_init(&renderer, ctx_flags, &renderer_cbs);
    if (ret) {
       fprintf(stderr, "failed to initialise renderer.\n");
