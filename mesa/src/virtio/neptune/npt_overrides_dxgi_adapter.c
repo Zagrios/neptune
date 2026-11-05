@@ -6,10 +6,13 @@
  * (npt_com_register_chain) with the vtbl of the highest version the host
  * adapter implements.  EnumOutputs is overridden to return
  * guest-fabricated IDXGIOutput wrappers, one per local DRM connector (or one synthetic fallback when
- * no DRM is available).  All other adapter methods pass through to the
- * host -- the host DXGI is itself DXVK, which already supplies the
- * vendor-keyed UMD versions etc.
+ * no DRM is available). Host UMD versions normally pass through; an unknown
+ * host version is resolved from Wine's existing virtual-adapter metadata.
  */
+
+#if defined(__WINE__)
+#include <windows.h>
+#endif
 
 #include "npt_com.h"
 #include "npt_display.h"
@@ -143,6 +146,63 @@ adp_EnumOutputs_override(void *self, UINT Output, IDXGIOutput **ppOutput)
    *ppOutput = (IDXGIOutput *)wrapper;
    return NPT_S_OK;
 }
+#if defined(__WINE__)
+/* A native macOS backend has no Windows UMD version. Keep DXGI consistent
+ * with the guest's existing driver record instead of reporting UINT64_MAX,
+ * which overflows applications that parse the four version components. */
+static bool
+adp_wine_driver_version(void *self, LARGE_INTEGER *version)
+{
+   DXGI_ADAPTER_DESC desc;
+   if (npt_idxgiadapter_default_GetDesc(self, &desc) < 0)
+      return false;
+
+   HKEY root;
+   if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\DirectX",
+                     0, KEY_READ, &root) != ERROR_SUCCESS)
+      return false;
+   DWORD count = 0;
+   bool found = false;
+   if (RegQueryInfoKeyW(root, NULL, NULL, NULL, &count, NULL, NULL,
+                        NULL, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+      for (DWORD i = 0; i < count && !found; ++i) {
+         WCHAR name[256];
+         DWORD length = sizeof(name) / sizeof(name[0]);
+         HKEY key;
+         if (RegEnumKeyExW(root, i, name, &length, NULL, NULL, NULL, NULL) != ERROR_SUCCESS ||
+             RegOpenKeyExW(root, name, 0, KEY_READ, &key) != ERROR_SUCCESS)
+            continue;
+         LUID luid;
+         LARGE_INTEGER candidate;
+         DWORD size = sizeof(luid);
+         bool matches = RegGetValueW(key, NULL, L"AdapterLuid", RRF_RT_REG_QWORD,
+                                      NULL, &luid, &size) == ERROR_SUCCESS &&
+                        luid.LowPart == desc.AdapterLuid.LowPart &&
+                        luid.HighPart == desc.AdapterLuid.HighPart;
+         size = sizeof(candidate);
+         if ((matches || count == 1) &&
+             RegGetValueW(key, NULL, L"DriverVersion", RRF_RT_REG_QWORD,
+                           NULL, &candidate, &size) == ERROR_SUCCESS &&
+             candidate.QuadPart != -1) {
+            *version = candidate;
+            found = true;
+         }
+         RegCloseKey(key);
+      }
+   }
+   RegCloseKey(root);
+   return found;
+}
+
+static HRESULT NPT_STDMETHODCALLTYPE
+adp_CheckInterfaceSupport_override(void *self, const GUID *iid, LARGE_INTEGER *version)
+{
+   HRESULT hr = npt_idxgiadapter_default_CheckInterfaceSupport(self, iid, version);
+   if (hr >= 0 && version && version->QuadPart == -1)
+      adp_wine_driver_version(self, version);
+   return hr;
+}
+#endif
 
 static HRESULT NPT_STDMETHODCALLTYPE
 adp3_RegisterHardwareContentProtectionTeardownStatusEvent_override(
@@ -209,6 +269,11 @@ npt_overrides_dxgi_adapter_init(void)
 {
    NPT_REGISTER_OVERRIDE_DXGI_ADAPTER(
       EnumOutputs, adp_EnumOutputs_override);
+
+#if defined(__WINE__)
+   NPT_REGISTER_OVERRIDE_DXGI_ADAPTER(
+      CheckInterfaceSupport, adp_CheckInterfaceSupport_override);
+#endif
 
    NPT_REGISTER_OVERRIDE_DXGI_ADAPTER3(
       RegisterHardwareContentProtectionTeardownStatusEvent,

@@ -39,6 +39,12 @@ scripts/build-server.sh                                    # build/prefix/{bin,l
 
 `build-server.sh` builds libepoxy 1.5.10 first. The server loads its backend at run time, for example `NPT_BACKEND=dxmt` with `NPT_D3D11_LIBRARY_PATH` and `NPT_DXGI_LIBRARY_PATH`. Voile builds both and ships them in its release: see [the Linux engine](https://github.com/Zagrios/voile#the-linux-engine) for how a launch starts them.
 
+## Wine adapter versions
+
+For `IDXGIAdapter::CheckInterfaceSupport`, meaningful backend versions and failed HRESULTs pass through unchanged. When a successful backend call reports `UINT64_MAX` (an unknown Windows UMD version on macOS), the Wine driver uses the existing DirectX registry `DriverVersion` for the matching adapter LUID, or the sole registered adapter. If no unambiguous version exists, the backend result is retained. This prevents the four-component version string from overflowing games such as Hunt: Showdown 1896; it does not establish game or anti-cheat compatibility.
+
+The standalone `tests/adapter-version.c` Wine integration regression exercises the public DXGI API, decimal parsing and an unsupported interface. Build it with the same x86-64 llvm-mingw toolchain, linking `dxgi` and `dxguid`, and run it in a Wine prefix with the built Neptune DLLs and a display adapter. Exit 0 is a pass; 77 means display prerequisites are unavailable.
+
 ## License
 
 Neptune, Mesa and virglrenderer are MIT licensed (Neptune: Copyright Turing Software LLC; Mesa and virglrenderer: their authors, see `mesa/docs/license.rst` and `virglrenderer/COPYING`), and their code keeps that license. Our changes are licensed under the GNU General Public License v3.0 (see `LICENSE`).

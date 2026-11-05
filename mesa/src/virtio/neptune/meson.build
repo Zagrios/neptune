@@ -103,6 +103,7 @@ if npt_is_windows
       'npt_common_wine.c',
     )
     npt_c_args += ['-D__WINE__']
+    npt_deps += [cc.find_library('advapi32')]
     if get_option('npt_wsi') == 'wsd'
       npt_c_args += ['-DNPT_WSI_WSD']
     endif
