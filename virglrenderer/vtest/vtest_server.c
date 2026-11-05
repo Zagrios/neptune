@@ -42,6 +42,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <string.h>
+#include <time.h>
 
 #include "util.h"
 #include "util/list.h"
@@ -855,6 +856,14 @@ static const struct vtest_command {
    HANDLER(RESOURCE_EXPORT_FD,          resource_export_fd,        true   ),
 };
 
+/* Obelisk: the monotonic clock in nanoseconds, for the fence poll below. */
+static uint64_t vtest_now_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 static int vtest_client_dispatch_commands(struct vtest_client *client)
 {
    TRACE_FUNC();
@@ -885,7 +894,17 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
       return 0;
    }
 
-   vtest_poll_resource_busy_wait();
+   /* Obelisk: retire the finished fences at most every 200 us rather than before every command. A poll asks the host
+    * GL about each pending fence (about 15 us on macOS), and a guest asks the busy state of resources thousands of
+    * times a second; a fence's own busy question polls itself (vtest_resource_busy_wait). */
+   {
+      static uint64_t last_poll;
+      uint64_t now = vtest_now_ns();
+      if (now - last_poll >= 200000) {
+         vtest_poll_resource_busy_wait();
+         last_poll = now;
+      }
+   }
    if (header[1] <= 0 || header[1] >= ARRAY_SIZE(vtest_commands)) {
       fprintf(stderr, "vtest: unknown command ID %u (len=%u)\n",
               header[1], header[0]);
