@@ -518,7 +518,7 @@ gsc12_present_common(void *self, UINT SyncInterval, UINT Flags)
       t3 = npt_profile_now_ns();
       npt_profile_log_present_timing((unsigned)SyncInterval, t0, t1, t2, t3);
    }
-   const bool occluded = c->occluded_streak >= NPT_SC_OCCLUDED_STREAK;
+   const bool occluded = npt_gsc_occluded(c);
    mtx_unlock(&c->present_mutex);
    return occluded ? NPT_DXGI_STATUS_OCCLUDED : NPT_S_OK;
 }
