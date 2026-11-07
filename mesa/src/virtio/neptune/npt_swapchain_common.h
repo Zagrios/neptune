@@ -220,6 +220,16 @@ npt_gsc_reuse_gate(struct npt_guest_swapchain_common *c, uint32_t image);
 bool
 npt_gsc_test_occluded(struct npt_guest_swapchain_common *c, uint32_t image);
 
+/* Windows returns DXGI_STATUS_OCCLUDED from Present while the window is minimized; the compositor here keeps
+ * taking frames of a hidden window, so without this a game never sees the code path it was written for.
+ * HELLDIVERS 2 minimizes itself on a focus loss, presents a few seconds into the hidden window, then its window
+ * thread waits on an event nobody signals. */
+static inline bool
+npt_gsc_iconic(const struct npt_guest_swapchain_common *c)
+{
+   return c->hwnd && IsIconic(c->hwnd);
+}
+
 void
 npt_gsc_query_window_size(struct npt_guest_swapchain_common *c,
                           UINT *width, UINT *height);

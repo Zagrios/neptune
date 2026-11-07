@@ -503,7 +503,7 @@ npt_gsc_test_occluded(struct npt_guest_swapchain_common *c, uint32_t image)
        atomic_load(&c->image_inflight[image]) == 0)
       c->occluded_streak = 0;
    const bool occluded =
-      c->wsi_failed || c->occluded_streak >= NPT_SC_OCCLUDED_STREAK;
+      c->wsi_failed || c->occluded_streak >= NPT_SC_OCCLUDED_STREAK || npt_gsc_iconic(c);
    mtx_unlock(&c->present_mutex);
    return occluded;
 }
