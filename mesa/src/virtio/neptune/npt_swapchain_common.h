@@ -50,8 +50,8 @@ unsigned npt_gsc_present_queue_limit(void);
 void npt_gsc_display_backpressure_wait(struct npt_guest_swapchain_common *c);
 
 /* Reuse-gate budget: how long Present waits for the compositor to
- * release the next pool image before proceeding anyway (a minimized
- * window never idles). */
+ * release the next pool image before proceeding anyway (a compositor
+ * that stopped taking frames never releases it). */
 #define NPT_SC_REUSE_WAIT_MS 100u
 
 /* DXGI's DXGI_MAX_SWAP_CHAIN_BUFFERS; also caps MaximumFrameLatency
@@ -100,9 +100,10 @@ struct npt_guest_swapchain_common {
    /* Auto-reset event the drain thread signals on each release so the
     * Present reuse-gate blocks instead of polling. */
    HANDLE image_release_evt;
-   /* Consecutive presents whose image never idled (hidden/minimized
-    * window): drives the DXGI_STATUS_OCCLUDED return so the app
-    * throttles instead of spinning. */
+   /* Consecutive presents whose image never idled (the compositor
+    * stopped taking frames): drives the DXGI_STATUS_OCCLUDED return so
+    * the app throttles instead of spinning.  A minimized window seldom
+    * builds it; npt_gsc_occluded() checks IsIconic for that. */
    uint32_t occluded_streak;
 
    /* Single lock over Present/Resize/GetBuffer. */
@@ -215,20 +216,15 @@ npt_gsc_backpressure_record(struct npt_guest_swapchain_common *c,
 void
 npt_gsc_reuse_gate(struct npt_guest_swapchain_common *c, uint32_t image);
 
+/* Whether Present reports DXGI_STATUS_OCCLUDED: the occluded streak is
+ * full or the window is minimized.  Called with present_mutex held. */
+bool
+npt_gsc_occluded(const struct npt_guest_swapchain_common *c);
+
 /* DXGI_PRESENT_TEST: whether a Present that takes this pool image now
  * reports DXGI_STATUS_OCCLUDED. */
 bool
 npt_gsc_test_occluded(struct npt_guest_swapchain_common *c, uint32_t image);
-
-/* Windows returns DXGI_STATUS_OCCLUDED from Present while the window is minimized; the compositor here keeps
- * taking frames of a hidden window, so without this a game never sees the code path it was written for.
- * HELLDIVERS 2 minimizes itself on a focus loss, presents a few seconds into the hidden window, then its window
- * thread waits on an event nobody signals. */
-static inline bool
-npt_gsc_iconic(const struct npt_guest_swapchain_common *c)
-{
-   return c->hwnd && IsIconic(c->hwnd);
-}
 
 void
 npt_gsc_query_window_size(struct npt_guest_swapchain_common *c,

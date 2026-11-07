@@ -460,8 +460,8 @@ fail:
 
 /* Reuse gate: block (bounded) until the drain thread reports X has
  * released this image, waking on its event rather than polling.  A
- * minimized window never idles; proceed anyway after the cap so the
- * app keeps running. */
+ * compositor that stopped taking frames never releases it; proceed
+ * anyway after the cap so the app keeps running. */
 void
 npt_gsc_reuse_gate(struct npt_guest_swapchain_common *c, uint32_t image)
 {
@@ -480,14 +480,32 @@ npt_gsc_reuse_gate(struct npt_guest_swapchain_common *c, uint32_t image)
    }
    if (atomic_load(&c->image_inflight[image]) != 0) {
       /* The image is still on-screen after the wait: the compositor
-       * isn't consuming frames (hidden/minimized).  After a few such
-       * presents report OCCLUDED so the app backs off; still present
-       * (some apps only re-render on OCCLUDED clear). */
+       * isn't consuming frames.  After a few such presents report
+       * OCCLUDED so the app backs off; still present (some apps only
+       * re-render on OCCLUDED clear).  A minimized window seldom gets
+       * here; npt_gsc_occluded() checks IsIconic for that. */
       if (c->occluded_streak < NPT_SC_OCCLUDED_STREAK)
          c->occluded_streak++;
    } else {
       c->occluded_streak = 0;
    }
+}
+
+/* The streak does not reliably see a minimized window: wsd keeps
+ * releasing its frames, each new one replacing the pending one, so the
+ * images come back.  IsIconic tells instead.  This follows Proton rather
+ * than Windows.  Windows reports a minimized window as occluded only to a
+ * blt-model swapchain; a flip-model one, and so every D3D12 swapchain,
+ * gets S_OK (Wine's dxgi tests check both).  Under Proton, Wine gives a
+ * minimized window an empty client area, so DXVK and vkd3d-proton see a
+ * zero-size surface and report OCCLUDED for either model.  HELLDIVERS 2,
+ * which minimizes itself on a focus loss, froze while Present kept
+ * returning S_OK. */
+bool
+npt_gsc_occluded(const struct npt_guest_swapchain_common *c)
+{
+   return c->occluded_streak >= NPT_SC_OCCLUDED_STREAK ||
+          (c->hwnd && IsIconic(c->hwnd));
 }
 
 /* Only the reuse gate clears the streak, and a test never runs it, while
@@ -502,8 +520,7 @@ npt_gsc_test_occluded(struct npt_guest_swapchain_common *c, uint32_t image)
    if (c->occluded_streak >= NPT_SC_OCCLUDED_STREAK &&
        atomic_load(&c->image_inflight[image]) == 0)
       c->occluded_streak = 0;
-   const bool occluded =
-      c->wsi_failed || c->occluded_streak >= NPT_SC_OCCLUDED_STREAK || npt_gsc_iconic(c);
+   const bool occluded = c->wsi_failed || npt_gsc_occluded(c);
    mtx_unlock(&c->present_mutex);
    return occluded;
 }
