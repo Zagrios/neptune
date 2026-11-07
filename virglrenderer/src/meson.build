@@ -111,6 +111,7 @@ neptune_sources = [
    'neptune/npt_common.c',
    'neptune/npt_context.c',
    'neptune/npt_cs.c',
+   'neptune/npt_d3dmetal_quirks.c',
    'neptune/npt_feedback.c',
    'neptune/npt_event.c',
    'neptune/npt_heap12.c',
@@ -127,7 +128,6 @@ neptune_sources = [
    'neptune/npt_overrides_toplevel.c',
    'neptune/npt_overrides_shared_handle.c',
    'neptune/npt_overrides_d3d12_device.c',
-   'neptune/npt_overrides_d3d12_pso_noop.c',
    'neptune/npt_overrides_d3d12_fence.c',
 ]
 
