@@ -111,6 +111,7 @@ neptune_sources = [
    'neptune/npt_common.c',
    'neptune/npt_context.c',
    'neptune/npt_cs.c',
+   'neptune/npt_d3dmetal_quirks.c',
    'neptune/npt_feedback.c',
    'neptune/npt_event.c',
    'neptune/npt_heap12.c',

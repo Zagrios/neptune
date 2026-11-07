@@ -16,6 +16,7 @@
 #endif
 
 #include "npt_com.h"
+#include "npt_d3dmetal_quirks.h"
 #include "npt_dispatch.h"
 #include "npt_event.h"
 #include "npt_feedback.h"
@@ -223,6 +224,7 @@ npt_context_register_object(struct npt_context *ctx,
    /* Key points into e->id so the hash key stays valid for e's lifetime. */
    _mesa_hash_table_insert(ctx->object_table, &e->id, e);
    mtx_unlock(&ctx->object_mutex);
+   npt_d3dmetal_on_register_object(obj, type);
 }
 
 void
