@@ -41,4 +41,8 @@ extern struct npt_dispatch_id3d12commandqueue_overrides
 extern struct npt_dispatch_id3d12fence_overrides
    npt_id3d12fence_overrides;
 
+/* Pipeline states whose Metal compile failed (npt_overrides_d3d12_pso_noop.c): called once per registered object,
+ * zeroes the garbage vertex-slot count of a no-op graphics pipeline state before any draw can walk it. */
+void npt_d3d12_pso_born(void *pso, bool is_pipeline_state);
+
 #endif /* NPT_OVERRIDES_H */

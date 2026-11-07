@@ -19,6 +19,7 @@
 #include "npt_dispatch.h"
 #include "npt_event.h"
 #include "npt_feedback.h"
+#include "npt_overrides.h"
 #include "npt_heap12.h"
 #include "npt_overrides.h"
 #include "npt_profile.h"
@@ -223,6 +224,7 @@ npt_context_register_object(struct npt_context *ctx,
    /* Key points into e->id so the hash key stays valid for e's lifetime. */
    _mesa_hash_table_insert(ctx->object_table, &e->id, e);
    mtx_unlock(&ctx->object_mutex);
+   npt_d3d12_pso_born(obj, npt_object_type_has_ancestor(type, NPT_OBJECT_TYPE_ID3D12PIPELINESTATE));
 }
 
 void
