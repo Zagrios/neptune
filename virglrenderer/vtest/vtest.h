@@ -114,6 +114,8 @@ int vtest_drm_sync_timeline_wait(uint32_t length_dw);
 int vtest_drm_sync_query(uint32_t length_dw);
 int vtest_drm_sync_transfer(uint32_t length_dw);
 int vtest_resource_export_fd(uint32_t length_dw);
+int vtest_obelisk_present_attach(uint32_t length_dw);
+int vtest_obelisk_present_detach(uint32_t length_dw);
 
 void vtest_set_max_length(uint32_t length);
 

@@ -52,8 +52,12 @@
 #endif
 
 #include "vtest.h"
+#include "vtest_cgl.h"
 #include "vtest_shm.h"
 #include "vtest_protocol.h"
+#ifdef __APPLE__
+#include "vtest_present.h"
+#endif
 #include "threadpool.h"
 
 #include "util.h"
@@ -82,6 +86,12 @@ struct vtest_resource {
    uint32_t res_id;
 
    struct iovec iov;
+
+   /* Obelisk: created with VIRGL_BIND_CUSTOM. Mesa's vtest winsys makes one such buffer per fence and reads the
+    * fence's state as the buffer's busy state (virgl_vtest_fence_create); the buffers the host writes results into
+    * (queries, resource layouts, memory info) carry the flag too. RESOURCE_BUSY_WAIT answers these with the state of
+    * the whole queue. */
+   bool fence;
 };
 
 struct vtest_sync {
@@ -627,6 +637,14 @@ int vtest_init_renderer(bool multi_clients,
 
    ctx_flags |= VIRGL_RENDERER_THREAD_SYNC |
                 VIRGL_RENDERER_USE_EXTERNAL_BLOB;
+#ifdef __APPLE__
+   /* No winsys flag and virgl wanted: the caller's GL contexts, CGL's (--use-cgl). */
+   if (!(ctx_flags & (VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLX | VIRGL_RENDERER_NO_VIRGL))) {
+      renderer_cbs.create_gl_context = vtest_cgl_create_context;
+      renderer_cbs.destroy_gl_context = vtest_cgl_destroy_context;
+      renderer_cbs.make_current = vtest_cgl_make_current;
+   }
+#endif
    ret = virgl_renderer_init(&renderer, ctx_flags, &renderer_cbs);
    if (ret) {
       fprintf(stderr, "failed to initialise renderer.\n");
@@ -826,6 +844,10 @@ void vtest_destroy_context(struct vtest_context *ctx)
    struct vtest_sync_wait *wait, *wait_tmp;
    UNUSED struct vtest_drm_sync_wait *drm_wait, *drm_wait_tmp;
    uint32_t i;
+
+#ifdef __APPLE__
+   vtest_present_forget_owner(ctx);
+#endif
 
    if (renderer.current_context == ctx) {
       renderer.current_context = NULL;
@@ -1290,6 +1312,7 @@ static int vtest_create_resource_internal(struct vtest_context *ctx,
    res = vtest_new_resource(args->handle);
    if (!res)
       return -ENOMEM;
+   res->fence = (args->bind & VIRGL_BIND_CUSTOM) != 0;
    args->handle = res->res_id;
 
    ret = virgl_renderer_resource_create(args, NULL, 0);
@@ -1842,6 +1865,29 @@ int vtest_resource_busy_wait(UNUSED uint32_t length_dw)
 
    /*  handle = bw_buf[VCMD_BUSY_WAIT_HANDLE]; unused as of now */
    flags = bw_buf[VCMD_BUSY_WAIT_FLAGS];
+
+   /* Obelisk: only a fence, or a buffer the host writes results into, needs the queue's state (see struct
+    * vtest_resource). For any other resource the guest asks before writing to the resource's guest storage or after
+    * reading it back, and neither needs the GPU to be idle here: commands are
+    * dispatched in order, so a TRANSFER_PUT2, TRANSFER_GET2 or SUBMIT_CMD sent before this request has been fully
+    * carried out (and its storage read or written) by the time this answer goes out, and the host's GL orders a write
+    * after the draws submitted before it. Answering "busy" for the whole queue made Mesa stall on every synchronized
+    * write and replace or stage buffers it could write in place; Killing Floor asked about 110 times a frame. */
+   if (bw_buf[VCMD_BUSY_WAIT_HANDLE]) {
+      struct vtest_resource *res = util_hash_table_get(ctx->resource_table,
+                                                       intptr_to_pointer(bw_buf[VCMD_BUSY_WAIT_HANDLE]));
+      if (res && !res->fence) {
+         uint32_t reply[VTEST_HDR_SIZE + 1];
+         reply[VTEST_CMD_LEN] = 1;
+         reply[VTEST_CMD_ID] = VCMD_RESOURCE_BUSY_WAIT;
+         reply[VTEST_CMD_DATA_START] = 0;
+         ret = vtest_block_write(ctx->out_fd, reply, sizeof(reply));
+         return ret < 0 ? ret : 0;
+      }
+   }
+   /* a fence or a host-written buffer: the queue's state, with the fences retired up to now (the dispatch loop polls
+    * at most every 200 us) */
+   virgl_renderer_poll();
 
    do {
       busy = renderer.implicit_fence_completed !=
@@ -3110,6 +3156,65 @@ out:
    close(fd);
 
    return ret;
+}
+
+int vtest_obelisk_present_attach(UNUSED uint32_t length_dw)
+{
+   struct vtest_context *ctx = vtest_get_current_context();
+   uint32_t cmd[VCMD_OBELISK_PRESENT_ATTACH_SIZE];
+   uint32_t resp_buf[VTEST_HDR_SIZE + 1];
+   int ret, fd;
+
+   ret = ctx->input->read(ctx->input, cmd, sizeof(cmd));
+   if (ret != sizeof(cmd))
+      return -1;
+   fd = vtest_receive_fd(ctx->input->data.fd);
+   if (fd < 0)
+      return fd;
+#ifdef __APPLE__
+   ret = vtest_present_attach(ctx,
+                              cmd[VCMD_OBELISK_PRESENT_ATTACH_TOKEN_LO] |
+                                 (uint64_t)cmd[VCMD_OBELISK_PRESENT_ATTACH_TOKEN_HI] << 32,
+                              cmd[VCMD_OBELISK_PRESENT_ATTACH_INDEX], cmd[VCMD_OBELISK_PRESENT_ATTACH_WIDTH],
+                              cmd[VCMD_OBELISK_PRESENT_ATTACH_HEIGHT], cmd[VCMD_OBELISK_PRESENT_ATTACH_STRIDE],
+                              cmd[VCMD_OBELISK_PRESENT_ATTACH_FORMAT],
+                              cmd[VCMD_OBELISK_PRESENT_ATTACH_SIZE_LO] |
+                                 (uint64_t)cmd[VCMD_OBELISK_PRESENT_ATTACH_SIZE_HI] << 32,
+                              fd);
+#else
+   close(fd);
+   ret = -ENOTSUP;
+#endif
+
+   resp_buf[VTEST_CMD_LEN] = 1;
+   resp_buf[VTEST_CMD_ID] = VCMD_OBELISK_PRESENT_ATTACH;
+   resp_buf[VTEST_CMD_DATA_START] = (uint32_t)ret;
+   ret = vtest_block_write(ctx->out_fd, resp_buf, sizeof(resp_buf));
+   return ret < 0 ? ret : 0;
+}
+
+int vtest_obelisk_present_detach(UNUSED uint32_t length_dw)
+{
+   struct vtest_context *ctx = vtest_get_current_context();
+   uint32_t cmd[VCMD_OBELISK_PRESENT_DETACH_SIZE];
+   uint32_t resp_buf[VTEST_HDR_SIZE + 1];
+   int ret;
+
+   ret = ctx->input->read(ctx->input, cmd, sizeof(cmd));
+   if (ret != sizeof(cmd))
+      return -1;
+#ifdef __APPLE__
+   ret = vtest_present_detach(ctx, cmd[VCMD_OBELISK_PRESENT_DETACH_TOKEN_LO] |
+                                      (uint64_t)cmd[VCMD_OBELISK_PRESENT_DETACH_TOKEN_HI] << 32);
+#else
+   ret = -ENOTSUP;
+#endif
+
+   resp_buf[VTEST_CMD_LEN] = 1;
+   resp_buf[VTEST_CMD_ID] = VCMD_OBELISK_PRESENT_DETACH;
+   resp_buf[VTEST_CMD_DATA_START] = (uint32_t)ret;
+   ret = vtest_block_write(ctx->out_fd, resp_buf, sizeof(resp_buf));
+   return ret < 0 ? ret : 0;
 }
 
 void vtest_set_max_length(uint32_t length)

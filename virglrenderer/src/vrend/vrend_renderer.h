@@ -38,6 +38,7 @@
 #define VIRGL_GBM_MAX_PLANES 4
 #endif
 #include "virgl_hw.h"
+#include "virglrenderer.h"
 #include <epoxy/gl.h>
 #ifdef WIN32
 #include <d3d11.h>
@@ -648,6 +649,7 @@ int vrend_renderer_resource_unmap(struct pipe_resource *pres);
 void vrend_renderer_get_meminfo(struct vrend_context *ctx, uint32_t res_handle);
 
 void vrend_context_emit_string_marker(struct vrend_context *ctx, GLsizei length, const char * message);
+void vrend_set_present_marker_callback(virgl_renderer_present_marker_cb cb);
 
 struct vrend_video_context *vrend_context_get_video_ctx(struct vrend_context *ctx);
 
