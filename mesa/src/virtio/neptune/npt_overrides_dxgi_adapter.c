@@ -6,9 +6,10 @@
  * (npt_com_register_chain) with the vtbl of the highest version the host
  * adapter implements.  EnumOutputs is overridden to return
  * guest-fabricated IDXGIOutput wrappers, one per local DRM connector (or one synthetic fallback when
- * no DRM is available).  All other adapter methods pass through to the
- * host -- the host DXGI is itself DXVK, which already supplies the
- * vendor-keyed UMD versions etc.
+ * no DRM is available).  D3DMetal and DXMT return ~0 as the UMD version,
+ * so CheckInterfaceSupport reports a plausible one instead (Hunt: Showdown
+ * 1896 parses it with std::stoull, Obelisk issue #46).  All other adapter
+ * methods pass through to the host.
  */
 
 #include "npt_com.h"
@@ -144,6 +145,22 @@ adp_EnumOutputs_override(void *self, UINT Output, IDXGIOutput **ppOutput)
    return NPT_S_OK;
 }
 
+/* Every success reports a made-up version, as DXVK and wined3d do: a Metal
+ * backend has no Windows UMD version to preserve.  This one is the
+ * DriverVersion win32u writes for every GPU under
+ * HKLM\Software\Microsoft\DirectX, 35.0.15.8180 (581.80 when the vendor is
+ * NVIDIA). */
+static HRESULT NPT_STDMETHODCALLTYPE
+adp_CheckInterfaceSupport_override(void *self, const GUID *InterfaceName,
+                                   LARGE_INTEGER *pUMDVersion)
+{
+   HRESULT hr = npt_idxgiadapter_default_CheckInterfaceSupport(
+      self, InterfaceName, pUMDVersion);
+   if (NPT_SUCCEEDED(hr) && pUMDVersion)
+      pUMDVersion->QuadPart = 0x00230000000f1ff4;
+   return hr;
+}
+
 static HRESULT NPT_STDMETHODCALLTYPE
 adp3_RegisterHardwareContentProtectionTeardownStatusEvent_override(
    void *self, HANDLE hEvent, DWORD *pdwCookie)
@@ -209,6 +226,8 @@ npt_overrides_dxgi_adapter_init(void)
 {
    NPT_REGISTER_OVERRIDE_DXGI_ADAPTER(
       EnumOutputs, adp_EnumOutputs_override);
+   NPT_REGISTER_OVERRIDE_DXGI_ADAPTER(
+      CheckInterfaceSupport, adp_CheckInterfaceSupport_override);
 
    NPT_REGISTER_OVERRIDE_DXGI_ADAPTER3(
       RegisterHardwareContentProtectionTeardownStatusEvent,
