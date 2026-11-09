@@ -42,6 +42,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <string.h>
+#include <time.h>
 
 #include "util.h"
 #include "util/list.h"
@@ -103,6 +104,7 @@ struct vtest_server
    bool use_glx;
    bool use_egl_surfaceless;
    bool use_gles;
+   bool use_cgl;
 
    bool venus;
    bool no_virgl;
@@ -220,6 +222,7 @@ while (__AFL_LOOP(1000)) {
 #define OPT_COMPAT_PROFILE 'c'
 #define OPT_DRM 'd'
 #define OPT_TCP_PORT 't'
+#define OPT_USE_CGL 'o'
 
 static void vtest_server_parse_args(int argc, char **argv)
 {
@@ -232,6 +235,9 @@ static void vtest_server_parse_args(int argc, char **argv)
       {"use-glx",             no_argument, NULL, OPT_USE_GLX},
       {"use-egl-surfaceless", no_argument, NULL, OPT_USE_EGL_SURFACELESS},
       {"use-gles",            no_argument, NULL, OPT_USE_GLES},
+#ifdef __APPLE__
+      {"use-cgl",             no_argument, NULL, OPT_USE_CGL},
+#endif
       {"rendernode",          required_argument, NULL, OPT_RENDERNODE},
       {"venus",               no_argument, NULL, OPT_VENUS},
       {"socket-path",         required_argument, NULL, OPT_SOCKET_PATH},
@@ -271,6 +277,11 @@ static void vtest_server_parse_args(int argc, char **argv)
       case OPT_USE_GLES:
          server.use_gles = true;
          break;
+#ifdef __APPLE__
+      case OPT_USE_CGL:
+         server.use_cgl = true;
+         break;
+#endif
       case OPT_RENDERNODE:
          server.render_device = optarg;
          break;
@@ -298,7 +309,7 @@ static void vtest_server_parse_args(int argc, char **argv)
 #endif
       default:
          printf("Usage: %s [--no-fork] [--no-loop-or-fork] [--multi-clients] "
-                "[--use-glx] [--use-egl-surfaceless] [--use-gles] [--no-virgl]"
+                "[--use-glx] [--use-egl-surfaceless] [--use-gles] [--use-cgl] [--no-virgl]"
                 "[--rendernode <dev>] [--socket-path <path>] "
 #ifdef ENABLE_VENUS
                 " [--venus]"
@@ -320,7 +331,14 @@ static void vtest_server_parse_args(int argc, char **argv)
       server.multi_clients = false;
    }
 
-   if (!server.no_virgl) {
+   if (!server.no_virgl && server.use_cgl) {
+      /* macOS: no winsys of virglrenderer's own; vtest_renderer gives vrend CGL contexts (vtest_cgl.c). */
+      if (server.use_glx || server.use_egl_surfaceless || server.use_gles || server.use_compat_profile) {
+         fprintf(stderr, "--use-cgl takes the core profile of desktop GL, without GLX, EGL or GLES.\n");
+         exit(EXIT_FAILURE);
+      }
+      server.ctx_flags = 0;
+   } else if (!server.no_virgl) {
       server.ctx_flags = VIRGL_RENDERER_USE_EGL;
       if (server.use_glx) {
          if (server.use_egl_surfaceless || server.use_gles) {
@@ -838,6 +856,14 @@ static const struct vtest_command {
    HANDLER(RESOURCE_EXPORT_FD,          resource_export_fd,        true   ),
 };
 
+/* Obelisk: the monotonic clock in nanoseconds, for the fence poll below. */
+static uint64_t vtest_now_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 static int vtest_client_dispatch_commands(struct vtest_client *client)
 {
    TRACE_FUNC();
@@ -868,7 +894,17 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
       return 0;
    }
 
-   vtest_poll_resource_busy_wait();
+   /* Obelisk: retire the finished fences at most every 200 us rather than before every command. A poll asks the host
+    * GL about each pending fence (about 15 us on macOS), and a guest asks the busy state of resources thousands of
+    * times a second; a fence's own busy question polls itself (vtest_resource_busy_wait). */
+   {
+      static uint64_t last_poll;
+      uint64_t now = vtest_now_ns();
+      if (now - last_poll >= 200000) {
+         vtest_poll_resource_busy_wait();
+         last_poll = now;
+      }
+   }
    if (header[1] <= 0 || header[1] >= ARRAY_SIZE(vtest_commands)) {
       fprintf(stderr, "vtest: unknown command ID %u (len=%u)\n",
               header[1], header[0]);

@@ -52,6 +52,7 @@
 #endif
 
 #include "vtest.h"
+#include "vtest_cgl.h"
 #include "vtest_shm.h"
 #include "vtest_protocol.h"
 #include "threadpool.h"
@@ -82,6 +83,12 @@ struct vtest_resource {
    uint32_t res_id;
 
    struct iovec iov;
+
+   /* Obelisk: created with VIRGL_BIND_CUSTOM. Mesa's vtest winsys makes one such buffer per fence and reads the
+    * fence's state as the buffer's busy state (virgl_vtest_fence_create); the buffers the host writes results into
+    * (queries, resource layouts, memory info) carry the flag too. RESOURCE_BUSY_WAIT answers these with the state of
+    * the whole queue. */
+   bool fence;
 };
 
 struct vtest_sync {
@@ -627,6 +634,14 @@ int vtest_init_renderer(bool multi_clients,
 
    ctx_flags |= VIRGL_RENDERER_THREAD_SYNC |
                 VIRGL_RENDERER_USE_EXTERNAL_BLOB;
+#ifdef __APPLE__
+   /* No winsys flag and virgl wanted: the caller's GL contexts, CGL's (--use-cgl). */
+   if (!(ctx_flags & (VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLX | VIRGL_RENDERER_NO_VIRGL))) {
+      renderer_cbs.create_gl_context = vtest_cgl_create_context;
+      renderer_cbs.destroy_gl_context = vtest_cgl_destroy_context;
+      renderer_cbs.make_current = vtest_cgl_make_current;
+   }
+#endif
    ret = virgl_renderer_init(&renderer, ctx_flags, &renderer_cbs);
    if (ret) {
       fprintf(stderr, "failed to initialise renderer.\n");
@@ -1290,6 +1305,7 @@ static int vtest_create_resource_internal(struct vtest_context *ctx,
    res = vtest_new_resource(args->handle);
    if (!res)
       return -ENOMEM;
+   res->fence = (args->bind & VIRGL_BIND_CUSTOM) != 0;
    args->handle = res->res_id;
 
    ret = virgl_renderer_resource_create(args, NULL, 0);
@@ -1842,6 +1858,29 @@ int vtest_resource_busy_wait(UNUSED uint32_t length_dw)
 
    /*  handle = bw_buf[VCMD_BUSY_WAIT_HANDLE]; unused as of now */
    flags = bw_buf[VCMD_BUSY_WAIT_FLAGS];
+
+   /* Obelisk: only a fence, or a buffer the host writes results into, needs the queue's state (see struct
+    * vtest_resource). For any other resource the guest asks before writing to the resource's guest storage or after
+    * reading it back, and neither needs the GPU to be idle here: commands are
+    * dispatched in order, so a TRANSFER_PUT2, TRANSFER_GET2 or SUBMIT_CMD sent before this request has been fully
+    * carried out (and its storage read or written) by the time this answer goes out, and the host's GL orders a write
+    * after the draws submitted before it. Answering "busy" for the whole queue made Mesa stall on every synchronized
+    * write and replace or stage buffers it could write in place; Killing Floor asked about 110 times a frame. */
+   if (bw_buf[VCMD_BUSY_WAIT_HANDLE]) {
+      struct vtest_resource *res = util_hash_table_get(ctx->resource_table,
+                                                       intptr_to_pointer(bw_buf[VCMD_BUSY_WAIT_HANDLE]));
+      if (res && !res->fence) {
+         uint32_t reply[VTEST_HDR_SIZE + 1];
+         reply[VTEST_CMD_LEN] = 1;
+         reply[VTEST_CMD_ID] = VCMD_RESOURCE_BUSY_WAIT;
+         reply[VTEST_CMD_DATA_START] = 0;
+         ret = vtest_block_write(ctx->out_fd, reply, sizeof(reply));
+         return ret < 0 ? ret : 0;
+      }
+   }
+   /* a fence or a host-written buffer: the queue's state, with the fences retired up to now (the dispatch loop polls
+    * at most every 200 us) */
+   virgl_renderer_poll();
 
    do {
       busy = renderer.implicit_fence_completed !=
