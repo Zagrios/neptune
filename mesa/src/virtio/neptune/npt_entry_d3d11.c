@@ -12,6 +12,40 @@
 
 #include "neptune-protocol/npt_protocol_guest_toplevel.h"
 #include "neptune-protocol/npt_protocol_defs.h"
+#include "neptune-protocol/npt_protocol_client_idxgifactory.h"
+
+#ifdef __WINE__
+/* Windows' d3d11 asks dxgi.dll for the swap chain, so every swap chain of
+ * a process presents through one Present.  d3d11.dll carries its own copy
+ * of the swap chain code: an overlay that finds Present on a swap chain made
+ * here, as the Epic Games one does, hooks a copy the game's swap chain,
+ * made through dxgi.dll's factory, never calls.  Fails when dxgi.dll has no
+ * factory to make it, for the caller to make it here instead. */
+static HRESULT
+npt_d3d11_swapchain_through_dxgi(ID3D11Device *device,
+                                 const DXGI_SWAP_CHAIN_DESC *desc,
+                                 IDXGISwapChain **out)
+{
+   /* Never freed: the swap chain's methods live in it. */
+   HMODULE dxgi = LoadLibraryA("dxgi.dll");
+   if (!dxgi)
+      return NPT_E_NOTIMPL;
+   HRESULT (WINAPI *create_factory)(REFIID, void **) =
+      (void *)GetProcAddress(dxgi, "CreateDXGIFactory1");
+   if (!create_factory)
+      return NPT_E_NOTIMPL;
+   void *factory = NULL;
+   HRESULT hr = create_factory(&NPT_IID_IDXGIFactory1, &factory);
+   if (NPT_FAILED(hr) || !factory)
+      return NPT_FAILED(hr) ? hr : NPT_E_FAIL;
+   const struct npt_idxgifactory_client_vtbl *v =
+      (const void *)((struct npt_com_base *)factory)->lpVtbl;
+   hr = v->CreateSwapChain(factory, (IUnknown *)device,
+                           (DXGI_SWAP_CHAIN_DESC *)desc, out);
+   v->Release(factory);
+   return hr;
+}
+#endif
 
 /* Cross-TU entry helpers: Triton's tritonDDI.c declares matching
  * externs, and the D3D11* exports below wrap them. */
@@ -291,8 +325,14 @@ npt_d3d11_create_device_and_swap_chain_internal(IDXGIAdapter *pAdapter,
 
    IDXGISwapChain *sc_wrapper = NULL;
    if (ppSwapChain && pSwapChainDesc) {
-      HRESULT sc_hr = npt_guest_swapchain_create_legacy(
-         device_wrapper, pSwapChainDesc, NULL, (void **)&sc_wrapper);
+      HRESULT sc_hr = NPT_E_NOTIMPL;
+#ifdef __WINE__
+      sc_hr = npt_d3d11_swapchain_through_dxgi(device_wrapper, pSwapChainDesc,
+                                                &sc_wrapper);
+#endif
+      if (NPT_FAILED(sc_hr))
+         sc_hr = npt_guest_swapchain_create_legacy(
+            device_wrapper, pSwapChainDesc, NULL, (void **)&sc_wrapper);
       /* E_NOTIMPL = no guest presentation backend (native Win32):
        * return a NULL swapchain with a successful device.  Real
        * failures fail the call. */
