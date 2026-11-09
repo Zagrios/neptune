@@ -50,6 +50,9 @@
 #include "util/u_memory.h"
 #include "vtest.h"
 #include "vtest_protocol.h"
+#ifdef __APPLE__
+#include "vtest_present.h"
+#endif
 #include "virglrenderer.h"
 #include "vtest_server.h"
 #include "virgl_util.h"
@@ -338,6 +341,8 @@ static void vtest_server_parse_args(int argc, char **argv)
          exit(EXIT_FAILURE);
       }
       server.ctx_flags = 0;
+      /* Obelisk: GL presents without a readback, at the guest's present markers (vtest_present.h) */
+      virgl_renderer_set_present_marker_callback(vtest_present_marker);
    } else if (!server.no_virgl) {
       server.ctx_flags = VIRGL_RENDERER_USE_EGL;
       if (server.use_glx) {
@@ -854,6 +859,8 @@ static const struct vtest_command {
    HANDLER(DRM_SYNC_TRANSFER,           drm_sync_transfer,         true   ),
 #endif /* ENABLE_DRM */
    HANDLER(RESOURCE_EXPORT_FD,          resource_export_fd,        true   ),
+   HANDLER(OBELISK_PRESENT_ATTACH,      obelisk_present_attach,    true   ),
+   HANDLER(OBELISK_PRESENT_DETACH,      obelisk_present_detach,    true   ),
 };
 
 /* Obelisk: the monotonic clock in nanoseconds, for the fence poll below. */

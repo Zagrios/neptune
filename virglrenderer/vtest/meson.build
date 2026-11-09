@@ -34,7 +34,7 @@ vtest_sources = [
 ]
 
 if with_host_darwin
-   vtest_sources += ['vtest_cgl.c', 'vtest_cgl.h']
+   vtest_sources += ['vtest_cgl.c', 'vtest_cgl.h', 'vtest_present.m', 'vtest_present.h']
 endif
 
 rt_dep = cc.find_library('rt', required : false)
@@ -50,7 +50,7 @@ vtest_depends = [
 ]
 
 if with_host_darwin
-   vtest_depends += [dependency('appleframeworks', modules : ['OpenGL'])]
+   vtest_depends += [dependency('appleframeworks', modules : ['OpenGL', 'Foundation', 'Metal', 'IOSurface'])]
 endif
 
 if with_tracing == 'percetto'

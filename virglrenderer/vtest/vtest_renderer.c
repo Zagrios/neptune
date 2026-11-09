@@ -55,6 +55,9 @@
 #include "vtest_cgl.h"
 #include "vtest_shm.h"
 #include "vtest_protocol.h"
+#ifdef __APPLE__
+#include "vtest_present.h"
+#endif
 #include "threadpool.h"
 
 #include "util.h"
@@ -841,6 +844,10 @@ void vtest_destroy_context(struct vtest_context *ctx)
    struct vtest_sync_wait *wait, *wait_tmp;
    UNUSED struct vtest_drm_sync_wait *drm_wait, *drm_wait_tmp;
    uint32_t i;
+
+#ifdef __APPLE__
+   vtest_present_forget_owner(ctx);
+#endif
 
    if (renderer.current_context == ctx) {
       renderer.current_context = NULL;
@@ -3149,6 +3156,65 @@ out:
    close(fd);
 
    return ret;
+}
+
+int vtest_obelisk_present_attach(UNUSED uint32_t length_dw)
+{
+   struct vtest_context *ctx = vtest_get_current_context();
+   uint32_t cmd[VCMD_OBELISK_PRESENT_ATTACH_SIZE];
+   uint32_t resp_buf[VTEST_HDR_SIZE + 1];
+   int ret, fd;
+
+   ret = ctx->input->read(ctx->input, cmd, sizeof(cmd));
+   if (ret != sizeof(cmd))
+      return -1;
+   fd = vtest_receive_fd(ctx->input->data.fd);
+   if (fd < 0)
+      return fd;
+#ifdef __APPLE__
+   ret = vtest_present_attach(ctx,
+                              cmd[VCMD_OBELISK_PRESENT_ATTACH_TOKEN_LO] |
+                                 (uint64_t)cmd[VCMD_OBELISK_PRESENT_ATTACH_TOKEN_HI] << 32,
+                              cmd[VCMD_OBELISK_PRESENT_ATTACH_INDEX], cmd[VCMD_OBELISK_PRESENT_ATTACH_WIDTH],
+                              cmd[VCMD_OBELISK_PRESENT_ATTACH_HEIGHT], cmd[VCMD_OBELISK_PRESENT_ATTACH_STRIDE],
+                              cmd[VCMD_OBELISK_PRESENT_ATTACH_FORMAT],
+                              cmd[VCMD_OBELISK_PRESENT_ATTACH_SIZE_LO] |
+                                 (uint64_t)cmd[VCMD_OBELISK_PRESENT_ATTACH_SIZE_HI] << 32,
+                              fd);
+#else
+   close(fd);
+   ret = -ENOTSUP;
+#endif
+
+   resp_buf[VTEST_CMD_LEN] = 1;
+   resp_buf[VTEST_CMD_ID] = VCMD_OBELISK_PRESENT_ATTACH;
+   resp_buf[VTEST_CMD_DATA_START] = (uint32_t)ret;
+   ret = vtest_block_write(ctx->out_fd, resp_buf, sizeof(resp_buf));
+   return ret < 0 ? ret : 0;
+}
+
+int vtest_obelisk_present_detach(UNUSED uint32_t length_dw)
+{
+   struct vtest_context *ctx = vtest_get_current_context();
+   uint32_t cmd[VCMD_OBELISK_PRESENT_DETACH_SIZE];
+   uint32_t resp_buf[VTEST_HDR_SIZE + 1];
+   int ret;
+
+   ret = ctx->input->read(ctx->input, cmd, sizeof(cmd));
+   if (ret != sizeof(cmd))
+      return -1;
+#ifdef __APPLE__
+   ret = vtest_present_detach(ctx, cmd[VCMD_OBELISK_PRESENT_DETACH_TOKEN_LO] |
+                                      (uint64_t)cmd[VCMD_OBELISK_PRESENT_DETACH_TOKEN_HI] << 32);
+#else
+   ret = -ENOTSUP;
+#endif
+
+   resp_buf[VTEST_CMD_LEN] = 1;
+   resp_buf[VTEST_CMD_ID] = VCMD_OBELISK_PRESENT_DETACH;
+   resp_buf[VTEST_CMD_DATA_START] = (uint32_t)ret;
+   ret = vtest_block_write(ctx->out_fd, resp_buf, sizeof(resp_buf));
+   return ret < 0 ? ret : 0;
 }
 
 void vtest_set_max_length(uint32_t length)
