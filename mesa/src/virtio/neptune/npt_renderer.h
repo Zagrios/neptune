@@ -149,7 +149,9 @@ struct npt_renderer_ops {
    void (*release_import_res)(struct npt_renderer *renderer,
                               uint32_t alloc, uint32_t res_kmt);
 
-   /* Implementation takes ownership (dups) the FDs.
+   /* One WSI instance per swapchain: init returns *out_wsi, which the
+    * other wsi_* ops take, until wsi_destroy.
+    * Implementation takes ownership (dups) the FDs.
     * virgl_format is an enum virgl_formats value; backends translate
     * to their target namespace (DRM fourcc, Vulkan format, ...).
     * hwnd is the swapchain's OutputWindow that the backend resolves to
@@ -162,7 +164,7 @@ struct npt_renderer_ops {
                     const uint32_t *strides,
                     uint32_t virgl_format,
                     uint32_t width, uint32_t height,
-                    uint64_t hwnd);
+                    uint64_t hwnd, uint64_t *out_wsi);
 
    /*
     * wait_fence_fd: sync_file (or -1) signalling host GPU done for
@@ -170,12 +172,12 @@ struct npt_renderer_ops {
     * (DRI3 >= 1.2); on older DRI3 the unixlib polls it before
     * presenting.  Unixlib owns the fd and must close it.
     */
-   void (*wsi_present)(struct npt_renderer *renderer,
+   void (*wsi_present)(struct npt_renderer *renderer, uint64_t wsi,
                        uint32_t image_index,
                        int wait_fence_fd,
                        uint32_t sync_interval);
 
-   void (*wsi_destroy)(struct npt_renderer *renderer);
+   void (*wsi_destroy)(struct npt_renderer *renderer, uint64_t wsi);
 
    /*
     * Per-image release COUNTS (NOT a bitmask): a fast client can
@@ -186,7 +188,7 @@ struct npt_renderer_ops {
     * host library's frame-latency sync; only an off-thread drain
     * can unwind onAcquireImage backpressure).
     */
-   int (*wsi_drain)(struct npt_renderer *renderer,
+   int (*wsi_drain)(struct npt_renderer *renderer, uint64_t wsi,
                     uint32_t timeout_ms,
                     uint32_t out_released_count[NPT_WSI_MAX_IMAGES]);
 
@@ -438,22 +440,23 @@ npt_renderer_wsi_init(struct npt_renderer *renderer,
                       const uint32_t *strides,
                       uint32_t virgl_format,
                       uint32_t width, uint32_t height,
-                      uint64_t hwnd)
+                      uint64_t hwnd, uint64_t *out_wsi)
 {
    if (renderer->ops.wsi_init)
       return renderer->ops.wsi_init(renderer, num_images, fds, strides,
-                                    virgl_format, width, height, hwnd);
+                                    virgl_format, width, height, hwnd,
+                                    out_wsi);
    return false;
 }
 
 static inline void
-npt_renderer_wsi_present(struct npt_renderer *renderer,
+npt_renderer_wsi_present(struct npt_renderer *renderer, uint64_t wsi,
                          uint32_t image_index,
                          int wait_fence_fd,
                          uint32_t sync_interval)
 {
    if (renderer->ops.wsi_present) {
-      renderer->ops.wsi_present(renderer, image_index, wait_fence_fd,
+      renderer->ops.wsi_present(renderer, wsi, image_index, wait_fence_fd,
                                 sync_interval);
       return;
    }
@@ -466,14 +469,14 @@ npt_renderer_wsi_present(struct npt_renderer *renderer,
 }
 
 static inline void
-npt_renderer_wsi_destroy(struct npt_renderer *renderer)
+npt_renderer_wsi_destroy(struct npt_renderer *renderer, uint64_t wsi)
 {
    if (renderer->ops.wsi_destroy)
-      renderer->ops.wsi_destroy(renderer);
+      renderer->ops.wsi_destroy(renderer, wsi);
 }
 
 static inline int
-npt_renderer_wsi_drain(struct npt_renderer *renderer,
+npt_renderer_wsi_drain(struct npt_renderer *renderer, uint64_t wsi,
                        uint32_t timeout_ms,
                        uint32_t out_released_count[NPT_WSI_MAX_IMAGES])
 {
@@ -482,7 +485,8 @@ npt_renderer_wsi_drain(struct npt_renderer *renderer,
          out_released_count[i] = 0;
    }
    if (renderer->ops.wsi_drain)
-      return renderer->ops.wsi_drain(renderer, timeout_ms, out_released_count);
+      return renderer->ops.wsi_drain(renderer, wsi, timeout_ms,
+                                     out_released_count);
    return -1;
 }
 
