@@ -163,15 +163,32 @@ adp_EnumOutputs_override(void *self, UINT Output, IDXGIOutput **ppOutput)
  * backend has no Windows UMD version to preserve.  This one is the
  * DriverVersion win32u writes for every GPU under
  * HKLM\Software\Microsoft\DirectX, 35.0.15.8180 (581.80 when the vendor is
- * NVIDIA). */
+ * NVIDIA).
+ *
+ * Except on an AMD adapter (D3DMetal's "AMD Compatibility Mode").  Hunt:
+ * Showdown 1896 prints the UMD version "%d.%02d.%02d.%04d", drops the dots
+ * and reads one number (CryRenderD3D12.dll "D3D Adapter: Driver version
+ * (UMD)"), and asks for at least 31.0.24027.1012 on AMD (3100240271012) and
+ * 32.0.15.5599 on NVIDIA (3200155599) before it stops showing "Outdated
+ * graphics driver detected".  35.0.15.8180 reads as 3500158180: enough for
+ * NVIDIA, but AMD build numbers have five digits.  An AMD adapter gets
+ * 35.0.21025.1024 instead, the DriverVersion win32u writes for AMD GPUs
+ * (3500210251024). */
 static HRESULT NPT_STDMETHODCALLTYPE
 adp_CheckInterfaceSupport_override(void *self, const GUID *InterfaceName,
                                    LARGE_INTEGER *pUMDVersion)
 {
    HRESULT hr = npt_idxgiadapter_default_CheckInterfaceSupport(
       self, InterfaceName, pUMDVersion);
-   if (NPT_SUCCEEDED(hr) && pUMDVersion)
-      pUMDVersion->QuadPart = 0x00230000000f1ff4;
+   if (NPT_SUCCEEDED(hr) && pUMDVersion) {
+      DXGI_ADAPTER_DESC desc;
+      memset(&desc, 0, sizeof(desc));
+      const bool amd =
+         NPT_SUCCEEDED(npt_idxgiadapter_default_GetDesc(self, &desc)) &&
+         desc.VendorId == 0x1002;
+      pUMDVersion->QuadPart = amd ? 0x0023000052210400   /* 35.0.21025.1024 */
+                                  : 0x00230000000f1ff4;  /* 35.0.15.8180 */
+   }
    return hr;
 }
 
