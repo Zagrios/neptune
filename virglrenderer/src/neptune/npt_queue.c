@@ -32,8 +32,16 @@
  * It has to be wall clock rather than a count of poll returns: the
  * ring's gate event is shared by all of that ring's gates, so another
  * gate's fire wakes this poll arbitrarily often without any time
- * passing.  Healthy work finishes orders of magnitude inside it. */
-#define NPT_QUEUE_DEVICE_LOST_SEC 30u
+ * passing.
+ *
+ * It has to be long, though.  Direct3D 12 lets an app arm
+ * SetEventOnCompletion (or a queue Wait) for a value it signals much
+ * later, and a wait retired early wakes the app with the fence short of
+ * the value it asked for, which an engine reads as a lost device: Hunt:
+ * Showdown 1896 keeps such waits for its whole session and quit with
+ * "D3D12 Device Removed" 30 s after start.  A day still frees a guest from
+ * a wedged host without cutting short any wait a game can plausibly hold. */
+#define NPT_QUEUE_DEVICE_LOST_SEC 86400u
 
 /* ----------------------------------------------------------------- */
 /* sync alloc / free / retire                                          */
