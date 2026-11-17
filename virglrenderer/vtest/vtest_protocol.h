@@ -93,6 +93,10 @@
 #define VCMD_DRM_SYNC_QUERY 36
 #define VCMD_DRM_SYNC_TRANSFER 37
 #define VCMD_RESOURCE_EXPORT_FD 38
+/* Obelisk: a shared-memory buffer for OpenGL presents (vtest_present.h), its fd with SCM_RIGHTS after the command */
+#define VCMD_OBELISK_PRESENT_ATTACH 39
+/* Obelisk: the end of a present chain, whose buffers and IOSurfaces go */
+#define VCMD_OBELISK_PRESENT_DETACH 40
 
 #define VCMD_RES_CREATE_SIZE 10
 #define VCMD_RES_CREATE_RES_HANDLE 0 /* must be 0 since protocol version 3 */
@@ -348,5 +352,22 @@ struct vcmd_submit_cmd2_batch {
 #define VCMD_RESOURCE_EXPORT_FD_SIZE 1
 #define VCMD_RESOURCE_EXPORT_FD_RES_HANDLE 0
 /* rsp fd */
+
+#define VCMD_OBELISK_PRESENT_ATTACH_SIZE 9
+#define VCMD_OBELISK_PRESENT_ATTACH_TOKEN_LO 0
+#define VCMD_OBELISK_PRESENT_ATTACH_TOKEN_HI 1
+#define VCMD_OBELISK_PRESENT_ATTACH_INDEX 2
+#define VCMD_OBELISK_PRESENT_ATTACH_WIDTH 3
+#define VCMD_OBELISK_PRESENT_ATTACH_HEIGHT 4
+#define VCMD_OBELISK_PRESENT_ATTACH_STRIDE 5
+#define VCMD_OBELISK_PRESENT_ATTACH_FORMAT 6 /* 1: BGRA8 */
+#define VCMD_OBELISK_PRESENT_ATTACH_SIZE_LO 7 /* a multiple of the page size, with the trailer after stride * height */
+#define VCMD_OBELISK_PRESENT_ATTACH_SIZE_HI 8
+/* rsp: 1 dword, 0 or a negative errno */
+
+#define VCMD_OBELISK_PRESENT_DETACH_SIZE 2
+#define VCMD_OBELISK_PRESENT_DETACH_TOKEN_LO 0
+#define VCMD_OBELISK_PRESENT_DETACH_TOKEN_HI 1
+/* rsp: 1 dword, 0 or a negative errno */
 
 #endif /* VTEST_PROTOCOL */

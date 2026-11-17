@@ -177,6 +177,23 @@ struct virgl_renderer_callbacks {
 VIRGL_EXPORT int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks *cb);
 VIRGL_EXPORT void virgl_renderer_poll(void); /* force fences */
 
+/* Obelisk: a GL context's present marker. A guest presents a frame by blitting it into a texture and then sending a
+ * string marker that starts with "obelisk-present " (glDebugMessageInsert of type GL_DEBUG_TYPE_MARKER, which Mesa
+ * passes on as a string marker when the renderer offers them); the callback gets the marker and the
+ * texture the context blitted into last, with that context's GL context current, in command order. With a callback
+ * set, the renderer offers string markers to its guests (VIRGL_CAP_V2_STRING_MARKER) even if the host GL has no
+ * KHR_debug. */
+struct virgl_renderer_present_source {
+   uint32_t gl_texture;
+   uint32_t gl_target;
+   uint32_t width, height;
+   uint32_t format; /* enum virgl_formats */
+   bool y_0_top;
+};
+typedef void (*virgl_renderer_present_marker_cb)(uint32_t ctx_id, const char *marker, uint32_t length,
+                                                 const struct virgl_renderer_present_source *src);
+VIRGL_EXPORT void virgl_renderer_set_present_marker_callback(virgl_renderer_present_marker_cb cb);
+
 /* we need to give qemu the cursor resource contents */
 VIRGL_EXPORT void *virgl_renderer_get_cursor_data(uint32_t resource_id, uint32_t *width, uint32_t *height);
 
