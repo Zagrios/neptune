@@ -463,11 +463,14 @@ npt_event_fini(struct npt_device *dev)
 }
 
 /* The next ring in round-robin order with no outstanding arm, else the
- * round-robin ring itself (all busy: the old behaviour).  Under arm_mutex. */
+ * round-robin ring itself (all busy: the old behaviour).  Under arm_mutex.
+ * npt_event_init repairs a degenerate range, so the span is never zero:
+ * every arm's registration is then paired with a release on every exit. */
 static uint32_t
 event_pick_ring(struct npt_event_state *st)
 {
    const uint32_t span = st->ring_end - st->ring_base;
+   assert(span);
    const uint32_t start =
       (atomic_fetch_add(&st->next_event_ring_idx, 1) - st->ring_base) % span;
    for (uint32_t k = 0; k < span; k++) {
@@ -503,6 +506,9 @@ npt_event_arm(struct npt_device *dev, void *hEvent)
       return 0;
 
    struct npt_event_state *st = dev->event;
+   struct event_pending *p = calloc(1, sizeof(*p));
+   if (!p)
+      return 0;
 
    /* SINGLE-USE token, minted per arm.  Keying the host proxy by the
     * raw HANDLE value reused one proxy pipe across every wait on the
@@ -526,40 +532,26 @@ npt_event_arm(struct npt_device *dev, void *hEvent)
     * don't queue up on one sync-queue worker, skipping rings that still
     * hold an arm (event_pick_ring). */
    const uint32_t ring_idx = event_pick_ring(st);
-   event_ring_hold(st, ring_idx);
    bool arm_ok = npt_dispatch_event_arm_fence(npt_device_method_ring(dev),
                                               token, ring_idx);
-   if (!arm_ok) {
-      event_ring_drop(st, ring_idx);
-      mtx_unlock(&st->arm_mutex);
-      npt_dispatch_event_release_ring(npt_device_method_ring(dev), token);
-      return 0;
-   }
    /* Hand the app's own event to the transport so the KMD can
     * KeSetEvent it straight from the completion DPC; the waiter then
     * only does token bookkeeping for that arm. */
    bool direct_ok = false;
-   int sync_fd = npt_renderer_submit_present_fence_direct(dev->renderer,
-                                                          ring_idx, hEvent,
-                                                          &direct_ok);
-   if (sync_fd < 0)
-      event_ring_drop(st, ring_idx);
+   int sync_fd = arm_ok
+      ? npt_renderer_submit_present_fence_direct(dev->renderer, ring_idx,
+                                                 hEvent, &direct_ok)
+      : -1;
+   if (sync_fd >= 0)
+      event_ring_hold(st, ring_idx);   /* dropped by the waiter */
    mtx_unlock(&st->arm_mutex);
 
    if (sync_fd < 0) {
+      free(p);
       npt_dispatch_event_release_ring(npt_device_method_ring(dev), token);
       return 0;
    }
 
-   struct event_pending *p = calloc(1, sizeof(*p));
-   if (!p) {
-      mtx_lock(&st->arm_mutex);
-      event_ring_drop(st, ring_idx);
-      mtx_unlock(&st->arm_mutex);
-      close_fd(sync_fd);
-      npt_dispatch_event_release_ring(npt_device_method_ring(dev), token);
-      return 0;
-   }
    p->ring_idx = ring_idx;
    p->sync_fd = sync_fd;
    p->handle  = hEvent;
@@ -617,11 +609,6 @@ npt_event_arm_token_fd(struct npt_device *dev, uint64_t token)
     * two or three frames earlier (Rocket League). */
    npt_dispatch_event_register_ring(npt_device_method_ring(dev), token);
 
-   /* npt_event_init repairs a degenerate range, so the span is never zero --
-    * npt_event_arm relies on the same invariant.  Asserting it keeps the
-    * registration above paired with a release on every reachable exit. */
-   assert(st->ring_end - st->ring_base);
-
    mtx_lock(&st->arm_mutex);
    const uint32_t ring_idx = event_pick_ring(st);
    bool arm_ok = npt_dispatch_event_arm_fence(npt_device_method_ring(dev),
@@ -650,8 +637,10 @@ npt_event_arm_token_fd(struct npt_device *dev, uint64_t token)
 void
 npt_event_release_token(struct npt_device *dev, uint64_t token)
 {
+   if (!token)
+      return;
    struct npt_event_state *st = dev ? dev->event : NULL;
-   if (token && st) {
+   if (st) {
       mtx_lock(&st->arm_mutex);
       for (uint32_t i = 0; i < NPT_EVENT_TOKEN_TRACK; i++) {
          if (st->token_rings[i].token == token) {
@@ -662,8 +651,7 @@ npt_event_release_token(struct npt_device *dev, uint64_t token)
       }
       mtx_unlock(&st->arm_mutex);
    }
-   if (token)
-      npt_dispatch_event_release_ring(npt_device_method_ring(dev), token);
+   npt_dispatch_event_release_ring(npt_device_method_ring(dev), token);
 }
 
 /*
@@ -712,8 +700,6 @@ npt_event_gate_arm(struct npt_device *dev, uint64_t fence_obj_id,
    if (!dev || !dev->event)
       return 0;
    struct npt_event_state *st = dev->event;
-
-   assert(st->ring_end - st->ring_base);
 
    mtx_lock(&st->arm_mutex);
    const uint32_t ring_idx = event_pick_ring(st);
