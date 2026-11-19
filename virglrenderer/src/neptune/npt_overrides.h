@@ -24,6 +24,7 @@ extern struct npt_dispatch_id3d11fence_overrides npt_id3d11fence_overrides;
 /* ID3D12Device: the shared-HANDLE rejections plus the FEATURE_LEVELS blob
  * repack (npt_overrides_d3d12_device.c). */
 extern struct npt_dispatch_id3d12device_overrides npt_id3d12device_overrides;
+extern struct npt_dispatch_id3d12device2_overrides npt_id3d12device2_overrides;
 
 /* Hooks Begin/End on the immediate context to maintain the per-query
  * pending list. */

@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "npt_context.h"
+#include "npt_async_pso.h"
 #include "npt_event.h"
 #include "npt_profile.h"
 #include "util/u_thread.h"
@@ -112,6 +113,26 @@ npt_queue_sync_retire(struct npt_queue *queue, struct npt_queue_sync *sync)
    if (sync->check_fence)
       npt_d3d12_gate_release(sync->check_fence);
    npt_queue_free_sync(sync);
+}
+
+/* Whether the sync's device-lost budget is spent.  Commands that wait for
+ * a pipeline still being compiled (npt_async_pso.c) hold their ring, and
+ * with it the work this fence waits for: that is a late completion, not a
+ * lost device, so the budget restarts from the last compilation. */
+static bool
+npt_queue_sync_expired(struct npt_queue_sync *sync)
+{
+   const uint64_t now = npt_profile_now_ns();
+   if (now < sync->deadline_ns)
+      return false;
+   const uint64_t active = npt_async_pso_last_activity_ns();
+   const uint64_t budget =
+      (uint64_t)NPT_QUEUE_DEVICE_LOST_SEC * 1000000000ull;
+   if (active && active + budget > now) {
+      sync->deadline_ns = active + budget;
+      return false;
+   }
+   return true;
 }
 
 /* ----------------------------------------------------------------- */
@@ -253,7 +274,7 @@ npt_queue_thread(void *arg)
              * will never wake us. */
             sync->fast_poll = true;
          }
-         if (npt_profile_now_ns() < sync->deadline_ns)
+         if (!npt_queue_sync_expired(sync))
             continue;
          npt_log("queue %u fence_id=%" PRIu64 ": gate value %" PRIu64
                  " not reached in %us, retiring as device-lost",
@@ -280,7 +301,7 @@ npt_queue_thread(void *arg)
          /* Poll timeout: keep waiting until the device-lost budget is
           * spent, then retire anyway so a wedged host (driver hang,
           * missing sync_file signal) doesn't trap the guest forever. */
-         if (npt_profile_now_ns() < sync->deadline_ns)
+         if (!npt_queue_sync_expired(sync))
             continue;
          npt_log("queue %u fence_id=%" PRIu64 ": no completion in %us, "
                  "retiring as device-lost", queue->ring_idx, sync->fence_id,

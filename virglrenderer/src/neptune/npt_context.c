@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #endif
 
+#include "npt_async_pso.h"
 #include "npt_com.h"
 #include "npt_d3dmetal_quirks.h"
 #include "npt_dispatch.h"
@@ -144,6 +145,11 @@ npt_context_init_dispatch(struct npt_context *ctx)
    d->id3d11device5_dispatch_overrides = &npt_id3d11device5_overrides;
    d->id3d11fence_dispatch_overrides = &npt_id3d11fence_overrides;
    d->id3d12device_dispatch_overrides = &npt_id3d12device_overrides;
+   d->id3d12device2_dispatch_overrides = &npt_id3d12device2_overrides;
+   d->id3d12graphicscommandlist_dispatch_overrides =
+      &npt_async_pso_list_overrides;
+   d->id3d12graphicscommandlist6_dispatch_overrides =
+      &npt_async_pso_list6_overrides;
    d->id3d11devicecontext_dispatch_overrides = &npt_query_dc_overrides;
    d->id3d11devicecontext4_dispatch_overrides = &npt_fence_dc4_overrides;
    d->id3d12commandqueue_dispatch_overrides =
@@ -349,9 +355,19 @@ npt_context_lookup_object_impl(struct npt_context *ctx,
    const struct hash_entry *entry =
       _mesa_hash_table_search(ctx->object_table, &id);
    const struct npt_object *obj = entry ? entry->data : NULL;
-   const npt_object_type actual = obj ? obj->type : (npt_object_type)0;
+   npt_object_type actual = obj ? obj->type : (npt_object_type)0;
    void *host_ptr = obj ? obj->host_ptr : NULL;
    mtx_unlock(&ctx->object_mutex);
+   /* A pipeline whose creation is still with the worker threads
+    * (npt_async_pso.c): wait for it, then look again. */
+   if (unlikely(!obj) && npt_async_pso_lookup_pending(ctx, id)) {
+      mtx_lock(&ctx->object_mutex);
+      entry = _mesa_hash_table_search(ctx->object_table, &id);
+      obj = entry ? entry->data : NULL;
+      actual = obj ? obj->type : (npt_object_type)0;
+      host_ptr = obj ? obj->host_ptr : NULL;
+      mtx_unlock(&ctx->object_mutex);
+   }
    if (obj && ce) {
       ce->id = id;
       ce->host_ptr = host_ptr;
@@ -367,6 +383,12 @@ npt_context_lookup_object_impl(struct npt_context *ctx,
 
    if (likely(obj && npt_object_type_is_compatible(actual, expected)))
       return host_ptr;
+
+   /* A pipeline still compiling that the command does without. */
+   if (!obj && npt_async_pso_lookup_skipped()) {
+      *miss = false;
+      return NULL;
+   }
 
    /* IUNKNOWN lookups are permissive: COM_RELEASE doesn't deref by type
     * and can legitimately race a Create that would register the id. */
@@ -412,6 +434,10 @@ void
 npt_context_release_object(struct npt_context *ctx, uint64_t guest_id)
 {
    if (!guest_id)
+      return;
+
+   /* A pipeline still being compiled is released when it is done. */
+   if (npt_async_pso_release_pending(ctx, guest_id))
       return;
 
    /* Permissive: stray RELEASE on an unregistered id (e.g. racing a
@@ -516,6 +542,24 @@ npt_cs_handle_lookup(struct npt_dispatch_context *dispatch,
 }
 
 void
+npt_context_register_null_object(struct npt_context *ctx, uint64_t guest_id)
+{
+   /* Obelisk: remember that this guest id stands for "nothing" (see null_ids) */
+   if (!guest_id || !ctx->null_ids)
+      return;
+   uint64_t *key = malloc(sizeof(*key));
+   if (!key)
+      return;
+   *key = guest_id;
+   mtx_lock(&ctx->object_mutex);
+   if (!_mesa_hash_table_search(ctx->null_ids, key))
+      _mesa_hash_table_insert(ctx->null_ids, key, NULL);
+   else
+      free(key);
+   mtx_unlock(&ctx->object_mutex);
+}
+
+void
 npt_cs_handle_register_guest_id(struct npt_dispatch_context *dispatch,
                                 uint64_t guest_id,
                                 void *obj,
@@ -525,17 +569,7 @@ npt_cs_handle_register_guest_id(struct npt_dispatch_context *dispatch,
       return;
    struct npt_context *ctx = npt_context_from_dispatch(dispatch);
    if (!obj) {
-      /* Obelisk: remember that this guest id stands for "nothing" (see null_ids) */
-      if (ctx->null_ids) {
-         uint64_t *key = malloc(sizeof(*key));
-         if (key) {
-            *key = guest_id;
-            mtx_lock(&ctx->object_mutex);
-            if (!_mesa_hash_table_search(ctx->null_ids, key)) _mesa_hash_table_insert(ctx->null_ids, key, NULL);
-            else free(key);
-            mtx_unlock(&ctx->object_mutex);
-         }
-      }
+      npt_context_register_null_object(ctx, guest_id);
       return;
    }
    if (npt_diag_was_missed(guest_id))
@@ -678,6 +712,9 @@ npt_context_destroy(struct npt_context *ctx)
 {
    npt_log("destroying Neptune context %u", ctx->ctx_id);
 
+   /* Before the rings stop: a ring thread may be waiting for one. */
+   npt_async_pso_drain(ctx);
+
    /* Stop the ring monitor before the rings so it can't touch a ring
     * mid-teardown. */
    npt_context_ring_monitor_fini(ctx);
@@ -687,6 +724,8 @@ npt_context_destroy(struct npt_context *ctx)
       npt_ring_stop(ring);
       npt_ring_destroy(ring);
    }
+   /* Again, for what the rings queued while they were stopping. */
+   npt_async_pso_drain(ctx);
 
    for (uint32_t i = 0; i < ARRAY_SIZE(ctx->sync_queues); i++) {
       if (ctx->sync_queues[i]) {
@@ -995,9 +1034,9 @@ npt_context_dispatch_one_command(struct npt_context *ctx,
        * tail check catches that. */
    } else {
       /* Generated dispatcher reads its own header. */
+      npt_async_pso_begin_command(peek.cmd_type);
       npt_dispatch_command(dispatch);
-      /* Event handles the decode substituted stay pinned for the
-       * duration of the call they were passed to. */
+      npt_async_pso_end_command();
       npt_event_unpin_dispatched(ctx);
    }
 

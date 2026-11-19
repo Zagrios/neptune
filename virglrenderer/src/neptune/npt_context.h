@@ -358,6 +358,11 @@ npt_context_register_object(struct npt_context *ctx,
                             void *obj,
                             npt_object_type type);
 
+/* Records guest_id as standing for no object: a lookup of it yields NULL
+ * without counting as a miss. */
+void
+npt_context_register_null_object(struct npt_context *ctx, uint64_t guest_id);
+
 void
 npt_context_unregister_object(struct npt_context *ctx, uint64_t id);
 

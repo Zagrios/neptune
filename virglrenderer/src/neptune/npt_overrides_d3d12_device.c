@@ -20,6 +20,7 @@
  */
 
 #include "npt_common.h"
+#include "npt_async_pso.h"
 #include "npt_overrides.h"
 
 #include "neptune-protocol/npt_protocol_defs.h"
@@ -103,9 +104,76 @@ npt_override_ID3D12Device_CheckFeatureSupport(
    return args->ret;
 }
 
+/* Pipeline creation goes to the worker threads of npt_async_pso.c; the
+ * call is made here only when that is off or cannot take it. */
+static HRESULT
+npt_override_ID3D12Device_CreateGraphicsPipelineState(
+   struct npt_dispatch_context *ctx,
+   struct npt_command_ID3D12Device_CreateGraphicsPipelineState *args,
+   PFN_ID3D12Device_CreateGraphicsPipelineState original)
+{
+   if (args->ppPipelineState &&
+       npt_async_pso_create_graphics(ctx, args->_self, args->pDesc,
+                                     args->riid,
+                                     args->_guest_id_ppPipelineState,
+                                     (void *)original)) {
+      args->ret = 0;
+      return args->ret;
+   }
+   args->ret = original(args->_self, args->pDesc, args->riid,
+                        args->ppPipelineState);
+   return args->ret;
+}
+
+static HRESULT
+npt_override_ID3D12Device_CreateComputePipelineState(
+   struct npt_dispatch_context *ctx,
+   struct npt_command_ID3D12Device_CreateComputePipelineState *args,
+   PFN_ID3D12Device_CreateComputePipelineState original)
+{
+   if (args->ppPipelineState &&
+       npt_async_pso_create_compute(ctx, args->_self, args->pDesc,
+                                    args->riid,
+                                    args->_guest_id_ppPipelineState,
+                                    (void *)original)) {
+      args->ret = 0;
+      return args->ret;
+   }
+   args->ret = original(args->_self, args->pDesc, args->riid,
+                        args->ppPipelineState);
+   return args->ret;
+}
+
+static HRESULT
+npt_override_ID3D12Device2_CreatePipelineState(
+   struct npt_dispatch_context *ctx,
+   struct npt_command_ID3D12Device2_CreatePipelineState *args,
+   PFN_ID3D12Device2_CreatePipelineState original)
+{
+   if (args->ppPipelineState &&
+       npt_async_pso_create_stream(ctx, args->_self, args->pDesc,
+                                   args->riid,
+                                   args->_guest_id_ppPipelineState,
+                                   (void *)original)) {
+      args->ret = 0;
+      return args->ret;
+   }
+   args->ret = original(args->_self, args->pDesc, args->riid,
+                        args->ppPipelineState);
+   return args->ret;
+}
+
 struct npt_dispatch_id3d12device_overrides npt_id3d12device_overrides = {
    .CreateSharedHandle = reject_ID3D12Device_CreateSharedHandle,
    .OpenSharedHandle = reject_ID3D12Device_OpenSharedHandle,
    .OpenSharedHandleByName = reject_ID3D12Device_OpenSharedHandleByName,
    .CheckFeatureSupport = npt_override_ID3D12Device_CheckFeatureSupport,
+   .CreateGraphicsPipelineState =
+      npt_override_ID3D12Device_CreateGraphicsPipelineState,
+   .CreateComputePipelineState =
+      npt_override_ID3D12Device_CreateComputePipelineState,
+};
+
+struct npt_dispatch_id3d12device2_overrides npt_id3d12device2_overrides = {
+   .CreatePipelineState = npt_override_ID3D12Device2_CreatePipelineState,
 };
