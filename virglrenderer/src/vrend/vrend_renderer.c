@@ -420,6 +420,14 @@ struct sysval_uniform_block {
 
 static struct global_renderer_state vrend_state;
 
+/* Obelisk: the server's present marker callback (virgl_renderer_set_present_marker_callback) */
+static virgl_renderer_present_marker_cb vrend_present_marker_cb;
+
+void vrend_set_present_marker_callback(virgl_renderer_present_marker_cb cb)
+{
+   vrend_present_marker_cb = cb;
+}
+
 static inline bool has_feature(enum features_id feature_id)
 {
    int slot = feature_id / 64;
@@ -835,6 +843,8 @@ struct vrend_context {
    struct vrend_sub_context *sub0;
 
    int ctx_id;
+   /* Obelisk: the destination of the last blit, the source of a present marker */
+   uint32_t last_blit_dst_handle;
    /* has this ctx gotten an error? */
    bool in_error;
    bool ctx_switch_pending;
@@ -11686,6 +11696,8 @@ void vrend_renderer_blit(struct vrend_context *ctx,
       return;
    }
 
+   ctx->last_blit_dst_handle = dst_handle;
+
    if (info->render_condition_enable == false)
       vrend_pause_render_condition(ctx, true);
 
@@ -13416,7 +13428,7 @@ angle_done:
       caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_MEMINFO;
    }
 
-   if (has_feature(feat_khr_debug))
+   if (has_feature(feat_khr_debug) || vrend_present_marker_cb)
        caps->v2.capability_bits_v2 |= VIRGL_CAP_V2_STRING_MARKER;
 
    if (has_feature(feat_implicit_msaa))
@@ -14389,6 +14401,28 @@ static uint32_t vrend_renderer_get_video_memory(void)
 void vrend_context_emit_string_marker(struct vrend_context *ctx, GLsizei length, const char * message)
 {
     VREND_DEBUG(dbg_khr, ctx, "MARKER: '%.*s'\n", length, message);
+
+    /* Obelisk: a present, see virgl_renderer_set_present_marker_callback */
+    if (vrend_present_marker_cb && length > 16 && !strncmp(message, "obelisk-present ", 16)) {
+       struct vrend_resource *res = ctx->last_blit_dst_handle ?
+          vrend_renderer_ctx_res_lookup(ctx, ctx->last_blit_dst_handle) : NULL;
+       /* a colour texture: a depth or stencil one is what a blit of the guest's own left there, not a frame */
+       if (res && res->gl_id && (res->target == GL_TEXTURE_2D || res->target == GL_TEXTURE_RECTANGLE) &&
+           !util_format_is_depth_or_stencil(res->base.format)) {
+          struct virgl_renderer_present_source src = {
+             .gl_texture = res->gl_id,
+             .gl_target = res->target,
+             .width = res->base.width0,
+             .height = res->base.height0,
+             .format = res->base.format,
+             .y_0_top = res->y_0_top,
+          };
+          vrend_present_marker_cb(ctx->ctx_id, message, length, &src);
+       } else {
+          vrend_present_marker_cb(ctx->ctx_id, message, length, NULL);
+       }
+       return;
+    }
 
 #ifdef ENABLE_TRACING
     char buf[256];

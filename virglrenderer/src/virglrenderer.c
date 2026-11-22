@@ -802,6 +802,11 @@ virgl_context_foreach_retire_fences(struct virgl_context *ctx,
    return true;
 }
 
+void virgl_renderer_set_present_marker_callback(virgl_renderer_present_marker_cb cb)
+{
+   vrend_set_present_marker_callback(cb);
+}
+
 void virgl_renderer_poll(void)
 {
    TRACE_FUNC();
