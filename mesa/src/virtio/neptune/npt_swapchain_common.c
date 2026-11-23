@@ -11,6 +11,7 @@
 #if defined(__WINE__)
 
 #include "npt_device.h"
+#include "npt_env.h"
 #include "npt_event.h"
 #include "npt_renderer.h"
 #include "npt_renderer_wine_common.h"
@@ -300,6 +301,8 @@ npt_gsc_backpressure_wait(struct npt_guest_swapchain_common *c)
    UINT cap = c->max_frame_latency;
    if (cap > NPT_SC_PRESENT_LATENCY)
       cap = NPT_SC_PRESENT_LATENCY;
+   if (npt_env.max_frame_latency && cap > npt_env.max_frame_latency)
+      cap = npt_env.max_frame_latency;
    if (c->latency_count < cap)
       return;
    int oldest = c->latency_fences[0];

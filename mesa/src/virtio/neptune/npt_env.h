@@ -87,6 +87,9 @@ struct npt_env {
     * (waiting for a pool thread -- head-of-line pressure) and wait_us
     * (the fence itself).  0 = off. */
    uint32_t event_waiter_trace_ms; /* NPT_EVENT_WAITER_TRACE */
+   /* Cap on the frames a guest swapchain lets run ahead of the host GPU,
+    * below what the app asks with SetMaximumFrameLatency.  0 = off. */
+   uint32_t max_frame_latency;     /* NPT_MAX_FRAME_LATENCY */
 };
 
 extern struct npt_env npt_env;
