@@ -64,6 +64,9 @@ npt_env_init_impl(void)
       parse_clamped_u32("NPT_PRESENT_GATE_TRACE", 0u, 0u, 60000u);
    npt_env.event_waiter_trace_ms =
       parse_clamped_u32("NPT_EVENT_WAITER_TRACE", 0u, 0u, 60000u);
+
+   npt_env.max_frame_latency =
+      parse_clamped_u32("NPT_MAX_FRAME_LATENCY", 0u, 1u, 3u);
 }
 
 static _Atomic int g_npt_env_init_state;
